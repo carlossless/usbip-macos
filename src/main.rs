@@ -1,5 +1,5 @@
 use core::panic;
-use std::{cell::RefCell, ffi::CStr, io::Error, mem, os::raw::c_void, ptr::{from_mut, NonNull}, rc::Rc, slice::{from_raw_parts, from_raw_parts_mut}, sync::Mutex, thread::sleep};
+use std::{cell::RefCell, cmp::{max, min}, ffi::CStr, io::Error, mem, os::raw::c_void, ptr::{from_mut, NonNull}, rc::Rc, slice::{from_raw_parts, from_raw_parts_mut}, sync::Mutex, thread::sleep};
 
 use block2::{global_block, Block, DynBlock, RcBlock};
 use dispatch2::dispatch_main;
@@ -95,6 +95,63 @@ const device_desc: UsbDescDevice = UsbDescDevice {
     iProduct: 2,
     iSerialNumber: 3,
     bNumConfigurations: 1,
+};
+
+#[repr(packed)]
+struct UsbDescConfiguration {
+    bLength: u8,
+    bDescriptorType: u8,
+    wTotalLength: u16,
+    bNumInterfaces: u8,
+    bConfigurationValue: u8,
+    iConfiguration: u8,
+    bmAttributes: u8,
+    bMaxPower: u8,
+}
+
+#[repr(packed)]
+struct UsbDescInterface {
+    bLength: u8,
+    bDescriptorType: u8,
+    bInterfaceNumber: u8,
+    bAlternateSetting: u8,
+    bNumEndpoints: u8,
+    bInterfaceClass: u8,
+    bInterfaceSubClass: u8,
+    bInterfaceProtocol: u8,
+    iInterface: u8,
+}
+
+const usb_desc_interface_main: UsbDescInterface = UsbDescInterface {
+    bLength: mem::size_of::<UsbDescInterface>() as u8,
+    bDescriptorType: UsbDescriptor::USB_DESC_INTERFACE as u8,
+    bInterfaceNumber: 0,
+    bAlternateSetting: 0,
+    bNumEndpoints: 1,
+    bInterfaceClass: UsbIface::USB_IFACE_CLASS_HID as u8,
+    bInterfaceSubClass: UsbIface::USB_IFACE_SUBCLASS_HID_BOOT as u8,
+    bInterfaceProtocol: 0 as u8, // lack enum
+    iInterface: 0,
+};
+
+#[repr(packed)]
+struct UsbDesc {
+    usb_desc: UsbDescConfiguration,
+    usb_desc_interface: UsbDescInterface,
+}
+
+const usb_desc: UsbDesc = UsbDesc {
+    usb_desc: UsbDescConfiguration {
+        bLength: mem::size_of::<UsbDescConfiguration>() as u8,
+        bDescriptorType: UsbDescriptor::USB_DESC_CONFIGURATION as u8,
+        wTotalLength: 0,
+        bNumInterfaces: 1,
+        bConfigurationValue: 1,
+        iConfiguration: 0,
+        bmAttributes: 0x80, // Bus powered
+        bMaxPower: 50, // 100mA
+    },
+    usb_desc_interface: usb_desc_interface_main,
 };
 
 fn command_handler(
@@ -278,6 +335,33 @@ fn command_handler(
                 panic!("Error: {:?}", res.err().unwrap());
             }
         }
+        IOUSBHostCIMessageType::EndpointPause => {
+            println!("ENDPOINT PAUSE!");
+
+            let device_adress: u8 = u8::try_from((command.data0 & IOUSBHostCICommandMessageData0DeviceAddress) >> IOUSBHostCICommandMessageData0DeviceAddressPhase).unwrap();
+            let endpoint_address: u8 = u8::try_from((command.data0 & IOUSBHostCICommandMessageData0EndpointAddress) >> IOUSBHostCICommandMessageData0EndpointAddressPhase).unwrap();
+
+            let lock = devices.lock().unwrap();
+            let dev = lock.iter().find(|dev| {
+                let address = unsafe { u8::try_from(dev.device.deviceAddress()).unwrap() };
+                address == device_adress
+            }).unwrap();
+
+            let ep = dev.endpoints.iter().find(|ep| {
+                let address = unsafe { u8::try_from(ep.endpointAddress()).unwrap() };
+                address == endpoint_address
+            }).unwrap();
+
+            let res = unsafe { ep.inspectCommand_error(NonNull::from(&command)) };
+            if res.is_err() {
+                panic!("Error: {:?}", res.err().unwrap());
+            }
+
+            let res = unsafe { ep.respondToCommand_status_error(NonNull::from(&command), IOUSBHostCIMessageStatus::Success) };
+            if res.is_err() {
+                panic!("Error: {:?}", res.err().unwrap());
+            }
+        }
         _ => {
             panic!("Unknown message type");
         }
@@ -370,18 +454,23 @@ fn doorbell_handler(
                         match request {
                             0x06 => {
                                 println!("GET_DESCRIPTOR");
-                                println!("Descriptor type: {:02x}", value >> 8);
-                                println!("Descriptor index: {:02x}", value & 0x00FF);   
-                                println!("Descriptor length: {:02x}", length);  
                                 get_descriptor(unsafe { controller.as_ref() }, ep, value);
                             }
                             _ => {
-                                println!("Unknown request: {:02x}", request);
+                                println!("Unknown GET request: {:02x}", request);
                             }
                         }
                     }
                     _ if requestType == (UsbDirection::USB_DIR_OUT as u8 | UsbType::USB_TYPE_STANDARD as u8 | UsbRecipient::USB_RECIP_DEVICE as u8) => {
-                        panic!("Request type: USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE");
+                        match request {
+                            0x09 => {
+                                println!("SET_CONFIGURATION");
+                                set_configuration(unsafe { controller.as_ref() }, ep, value);
+                            }
+                            _ => {
+                                println!("Unknown SET request: {:02x}", request);
+                            }
+                        }
                     }
                     _ => {
                         panic!("Unknown request type");
@@ -412,20 +501,36 @@ fn get_descriptor(
             println!("Device descriptor");
             scratch = unsafe { from_raw_parts(&device_desc as *const _ as *const u8, mem::size_of::<UsbDescDevice>()) };
         }
+        0x02 => {
+            println!("Configuration descriptor");
+            scratch = unsafe { from_raw_parts(&usb_desc as *const _ as *const u8, mem::size_of::<UsbDescConfiguration>()) };
+        }
         0x03 => {
             println!("String descriptor {:02x}", desc_index);
-            let string = match desc_index {
-                1 => "Carlosless Chedar",
-                2 => "USBIP Device",
-                3 => "1234567890",
-                _ => panic!("Unknown string descriptor index: {}", desc_index),
-            };
-            let len = string.len() * 2 + 2;
-            scratch_page.resize(len, 0);
-            scratch_page[0] = string.len() as u8 * 2 + 2;
-            scratch_page[1] = UsbDescriptor::USB_DESC_STRING as u8;
-            scratch_page[2..].iter_mut().zip(string.as_bytes().iter().flat_map(|&b| [b, 0])).for_each(|(s, b)| *s = b);
-            scratch = &scratch_page;
+
+            if desc_index == 0 {
+                scratch_page.resize(6, 0);
+                scratch_page[0] = 6;
+                scratch_page[1] = UsbDescriptor::USB_DESC_STRING as u8;
+                scratch_page[2] = 0x09; // Unicode
+                scratch_page[3] = 0x04; // English
+                scratch_page[4] = 0x00; // Language ID
+                scratch_page[5] = 0x00; // Language ID
+                scratch = &scratch_page;
+            } else {
+                let string = match desc_index {
+                    1 => "Carlosless Chedar",
+                    2 => "USBIP Device",
+                    3 => "1234567890",
+                    _ => panic!("Unknown string descriptor index: {}", desc_index),
+                };
+                let len = string.len() * 2 + 2;
+                scratch_page.resize(len, 0);
+                scratch_page[0] = string.len() as u8 * 2 + 2;
+                scratch_page[1] = UsbDescriptor::USB_DESC_STRING as u8;
+                scratch_page[2..].iter_mut().zip(string.as_bytes().iter().flat_map(|&b| [b, 0])).for_each(|(s, b)| *s = b);
+                scratch = &scratch_page;
+            }
         }
         _ => {
             panic!("Unknown descriptor type: {:02x}", desc_type);
@@ -460,7 +565,12 @@ fn get_descriptor(
     let data_length: u32 = ((msg.data0 & IOUSBHostCINormalTransferData0Length) >> IOUSBHostCINormalTransferData0LengthPhase).try_into().unwrap();
     let buffer: &mut [u8] = unsafe { from_raw_parts_mut(((msg.data1 & IOUSBHostCINormalTransferData1Buffer) >> IOUSBHostCINormalTransferData1BufferPhase) as *mut _, data_length as usize) };
 
-    buffer.copy_from_slice(&scratch[..data_length as usize]);
+    let real_length = min(scratch.len(), data_length as usize);
+    if (real_length as u32) != data_length {
+        println!("WARN: Data length mismatch: {} != {}", real_length, data_length);
+    }
+
+    buffer[..real_length].copy_from_slice(&scratch[..real_length as usize]);
 
     let res = unsafe { ep.enqueueTransferCompletionForMessage_status_transferLength_error(NonNull::from(msg), IOUSBHostCIMessageStatus::Success, data_length as usize) };
     if res.is_err() {
@@ -487,7 +597,56 @@ fn get_descriptor(
     if res.is_err() {
         panic!("Error: {:?}", res.err().unwrap());
     }
+}
 
+fn set_configuration(
+    controller: &IOUSBHostControllerInterface,
+    ep: &IOUSBHostCIEndpointStateMachine,
+    value: u16,
+) {
+    println!("Set configuration: {:02x}", value);
+
+    let msg = unsafe { ep.currentTransferMessage().as_ref() };
+    if (msg.control & IOUSBHostCIMessageControlValid) == 0 {
+        panic!("Message is not valid");
+    }
+
+    let msg_type = IOUSBHostCIMessageType((msg.control & IOUSBHostCIMessageControlType) >> IOUSBHostCIMessageControlTypePhase);
+    println!("MSG type: {}", unsafe { CStr::from_ptr(msg_type.to_string()).to_str().unwrap() });
+
+    if msg_type != IOUSBHostCIMessageType::SetupTransfer {
+        panic!("Message is not a setup transfer");
+    }
+
+    if msg.control & IOUSBHostCIMessageControlNoResponse != 0 {
+        panic!("Message should need a response");
+    }
+
+    let res = unsafe { ep.enqueueTransferCompletionForMessage_status_transferLength_error(NonNull::from(msg), IOUSBHostCIMessageStatus::Success, 0) };
+    if res.is_err() {
+        panic!("Error: {:?}", res.err().unwrap());
+    }
+
+    let msg = unsafe { ep.currentTransferMessage().as_ref() };
+    if (msg.control & IOUSBHostCIMessageControlValid) == 0 {
+        panic!("Message is not valid");
+    }
+
+    let msg_type = IOUSBHostCIMessageType((msg.control & IOUSBHostCIMessageControlType) >> IOUSBHostCIMessageControlTypePhase);
+    println!("MSG type: {}", unsafe { CStr::from_ptr(msg_type.to_string()).to_str().unwrap() });
+
+    if msg_type != IOUSBHostCIMessageType::StatusTransfer {
+        panic!("Message is not a status transfer");
+    }
+
+    if msg.control & IOUSBHostCIMessageControlNoResponse != 0 {
+        panic!("Message should need a response");
+    }
+
+    let res = unsafe { ep.enqueueTransferCompletionForMessage_status_transferLength_error(NonNull::from(msg), IOUSBHostCIMessageStatus::Success, 0) };
+    if res.is_err() {
+        panic!("Error: {:?}", res.err().unwrap());
+    }
 }
 
 unsafe extern "C-unwind" fn interest_handler(
