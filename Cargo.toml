@@ -1,14 +1,13 @@
 [package]
-name = "usbip"
+name = "usbip-darwin"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-block2 = "0.6.1"
+objc2 = { git = "ssh://git@github.com/carlossless/objc2.git", branch = "fix/objc2-io-usb-host"}
+block2 = { git = "ssh://git@github.com/carlossless/objc2.git", branch = "fix/objc2-io-usb-host" }
+dispatch2 = { git = "ssh://git@github.com/carlossless/objc2.git", branch = "fix/objc2-io-usb-host" }
+objc2-foundation = { git = "ssh://git@github.com/carlossless/objc2.git", branch = "fix/objc2-io-usb-host" }
+objc2-io-usb-host = { git = "ssh://git@github.com/carlossless/objc2.git", branch = "fix/objc2-io-usb-host" }
 bytes = "1.10.1"
-dispatch2 = "0.3.0"
-# objc2 = { version ="0.6.1", features = ["relax-sign-encoding"] } # relax-sign-encoding is needed 
-objc2 = { version ="0.6.1" }
-objc2-foundation = "0.3.1"
-objc2-io-usb-host = "0.3.1"
 tokio = { version = "1", features = ["full"] }
