@@ -132,6 +132,8 @@ enum UsbRecipient {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    connect_to_usbip_server("carlossless-chedar:3240").await?;
+
     let con_iface = ControllerInterface::new();
 
     dispatch_main();
