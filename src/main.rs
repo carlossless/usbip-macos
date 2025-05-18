@@ -3,7 +3,7 @@ use std::{io::Error};
 use controller_interface::ControllerInterface;
 use dispatch2::dispatch_main;
 use tokio;
-use usbip::connect_to_usbip_server;
+use usbip::{connect_to_usbip_server, UsbIpClient};
 
 mod controller_interface;
 mod device;
@@ -130,15 +130,24 @@ enum UsbRecipient {
     USB_RECIP_MASK = 0b00001111,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
-    connect_to_usbip_server("carlossless-chedar:3240").await?;
+// #[tokio::main]
+fn main() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-    let con_iface = ControllerInterface::new();
+    let addr = "carlossless-chedar:3240";
+
+    let mut client = UsbIpClient::new();
+    rt.block_on(client.connect(addr)).unwrap();
+    let devices = rt.block_on(client.list_devices()).unwrap();
+    let device = devices.first().unwrap();
+
+    rt.block_on(client.connect(addr)).unwrap();
+    rt.block_on(client.import_device(*device.get_busid())).unwrap();
+
+    let con_iface = ControllerInterface::new(client);
 
     dispatch_main();
-
-    connect_to_usbip_server("carlossless-chedar:3240").await?;
-
-    Ok(())
 }

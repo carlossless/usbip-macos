@@ -1,17 +1,34 @@
 use std::{ffi::CStr, fmt::Debug, io::Error};
 
+use bitflags::bitflags;
 use bytes::{Buf, BufMut, BytesMut};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, stream};
 
 const USBIP_VERSION: u16 = 273;
 
-struct Interface {
+bitflags! {
+    /// Represents a set of flags.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct UrbTransferFlags: u32 {
+        // Allowed transfer_flags  | value      | control | interrupt | bulk     | isochronous
+        const ShortNotOk       = 0x00000001; // only in | only in   | only in  | no
+        const IsoAsap          = 0x00000002; // no      | no        | no       | yes
+        const NoTransferDmaMap = 0x00000004; // yes     | yes       | yes      | yes
+        const NoFsbr           = 0x00000020; // yes     | no        | no       | no
+        const ZeroPacket       = 0x00000040; // no      | no        | only out | no
+        const NoInterrupt      = 0x00000080; // yes     | yes       | yes      | yes
+        const FreeBuffer       = 0x00000100; // yes     | yes       | yes      | yes
+        const DirMask          = 0x00000200; // yes     | yes       | yes      | yes
+    }
+}
+
+pub struct Interface {
     interface_class: u8,
     interface_subclass: u8,
     interface_protocol: u8,
 }
 
-struct Device {
+pub struct Device {
     path: [u8; 256],
     busid: [u8; 32],
     busnum: u32,
@@ -29,18 +46,205 @@ struct Device {
     interfaces: Vec<Interface>,
 }
 
+impl Device {
+    pub fn get_busid(&self) -> &[u8; 32] {
+        &self.busid
+    }
+}
+
 #[repr(u16)]
 enum UsbIpCommand {
     ReqDevlist = 0x8005,
-    ReqImport = 0x8003,
+    ReqImport = 0x8003
 }
 
 impl Debug for UsbIpCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UsbIpCommand::ReqDevlist => f.write_str("USBIP_REQ_DEVLIST"),
-            UsbIpCommand::ReqImport => f.write_str("USBIP_REQ_IMPORT"),
+            Self::ReqDevlist => f.write_str("USBIP_REQ_DEVLIST"),
+            Self::ReqImport => f.write_str("USBIP_REQ_IMPORT"),
         }
+    }
+}
+
+#[repr(u32)]
+enum UsbIpCommand2 {
+    CmdSubmit = 0x00000001
+}
+
+impl Debug for UsbIpCommand2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CmdSubmit => f.write_str("USBIP_CMD_SUBMIT"),
+        }
+    }
+}
+
+#[repr(u32)]
+enum UsbIpDirection {
+    UsbDirOut = 0,
+    UsbDirIn = 1,
+}
+
+pub struct UsbCommandHeader {
+    command: u32,
+    seqnum: u32,
+    devid: u32,
+    direction: u32,
+    ep_number: u32,
+}
+
+impl Debug for UsbCommandHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsbCommandHeader")
+            .field("command", &self.command)
+            .field("seqnum", &self.seqnum)
+            .field("devid", &self.devid)
+            .field("direction", &self.direction)
+            .field("ep_number", &self.ep_number)
+            .finish()
+    }
+}
+
+impl UsbCommandHeader {
+    pub fn new(command: u32, seqnum: u32, devid: u32, direction: u32, ep_number: u32) -> Self {
+        UsbCommandHeader {
+            command,
+            seqnum,
+            devid,
+            direction,
+            ep_number,
+        }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let mut buf = &bytes[..];
+        let command = buf.get_u32();
+        let seqnum = buf.get_u32();
+        let devid = buf.get_u32();
+        let direction = buf.get_u32();
+        let ep_number = buf.get_u32();
+
+        UsbCommandHeader {
+            command,
+            seqnum,
+            devid,
+            direction,
+            ep_number,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; 20] {
+        let mut buf = Vec::new();
+        buf.put_u32(self.command);
+        buf.put_u32(self.seqnum);
+        buf.put_u32(self.devid);
+        buf.put_u32(self.direction);
+        buf.put_u32(self.ep_number);
+        buf.try_into().unwrap()
+    }
+}
+
+pub struct UsbCommandSubmit {
+    header: UsbCommandHeader,
+    transfer_flags: u32,
+    transfer_buffer_length: u32,
+    start_frame: u32,
+    number_of_packets: u32,
+    interval: u32,
+    setup_bytes: [u8; 8],
+}
+
+impl Debug for UsbCommandSubmit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsbCommandSubmit")
+            .field("header", &self.header)
+            .field("transfer_flags", &self.transfer_flags)
+            .field("transfer_buffer_length", &self.transfer_buffer_length)
+            .field("start_frame", &self.start_frame)
+            .field("number_of_packets", &self.number_of_packets)
+            .field("interval", &self.interval)
+            .field("setup_bytes", &self.setup_bytes)
+            .finish()
+    }
+}
+
+impl UsbCommandSubmit {
+    pub fn new(
+        header: UsbCommandHeader,
+        transfer_flags: u32,
+        transfer_buffer_length: u32,
+        start_frame: u32,
+        number_of_packets: u32,
+        interval: u32,
+        setup_bytes: [u8; 8],
+    ) -> Self {
+        UsbCommandSubmit {
+            header,
+            transfer_flags,
+            transfer_buffer_length,
+            start_frame,
+            number_of_packets,
+            interval,
+            setup_bytes,
+        }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let mut buf = &bytes[..];
+        let header = UsbCommandHeader::from_bytes(&buf[0..20]);
+        let transfer_flags = buf.get_u32();
+        let transfer_buffer_length = buf.get_u32();
+        let start_frame = buf.get_u32();
+        let number_of_packets = buf.get_u32();
+        let interval = buf.get_u32();
+        let setup_bytes = buf.copy_to_bytes(8).to_vec().try_into().unwrap();
+
+        UsbCommandSubmit {
+            header,
+            transfer_flags,
+            transfer_buffer_length,
+            start_frame,
+            number_of_packets,
+            interval,
+            setup_bytes,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.put(&self.header.to_bytes()[..]);
+        buf.put_u32(self.transfer_flags);
+        buf.put_u32(self.transfer_buffer_length);
+        buf.put_u32(self.start_frame);
+        buf.put_u32(self.number_of_packets);
+        buf.put_u32(self.interval);
+        buf.put(&self.setup_bytes[..]);
+        buf
+    }
+}
+
+pub struct UsbReturnSubmit {
+    header: UsbCommandHeader,
+    status: u32,
+    pub actual_length: u32,
+    start_frame: u32,
+    number_of_packets: u32,
+    error_count: u32,
+    pub buffer: Vec<u8>,
+}
+
+impl Debug for UsbReturnSubmit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsbReturnSubmit")
+            .field("header", &self.header)
+            .field("status", &self.status)
+            .field("actual_length", &self.actual_length)
+            .field("start_frame", &self.start_frame)
+            .field("number_of_packets", &self.number_of_packets)
+            .field("error_count", &self.error_count)
+            .field("buffer", &self.buffer)
+            .finish()
     }
 }
 
@@ -76,13 +280,17 @@ impl Debug for Interface {
     }
 }
 
-struct UsbIpClient {
-    stream: Option<TcpStream>
+pub struct UsbIpClient {
+    stream: Option<TcpStream>,
+    imported_device: Option<Device>,
 }
 
 impl UsbIpClient {
     pub fn new() -> Self {
-        UsbIpClient { stream: None }
+        UsbIpClient {
+            stream: None,
+            imported_device: None,
+        }
     }
 
     pub async fn connect(&mut self, addr: &str) -> Result<(), Error> {
@@ -187,16 +395,130 @@ impl UsbIpClient {
         stream.write_all(&request).await?;
 
 
-        stream.read_u16().await?;
-        stream.read_u16().await?;
+        stream.read_u16().await?; // version
+        stream.read_u16().await?; // reply code
         let status = stream.read_u32().await?;
         if status != 0 {
             return Err(Error::new(std::io::ErrorKind::Other, "Failed to import device"));
         }
 
-        println!("Received {:?} response, status: {}", UsbIpCommand::ReqImport, status);
+        let mut path: [u8; 256] = [0; 256];
+        let mut busid: [u8; 32] = [0; 32];
+        stream.read_exact(&mut path).await?;
+        stream.read_exact(&mut busid).await?;
+        let busnum = stream.read_u32().await?;
+        let devnum = stream.read_u32().await?;
+        let speed = stream.read_u32().await?;
+        let id_vendor = stream.read_u16().await?;
+        let id_product = stream.read_u16().await?;
+        let bcd_device = stream.read_u16().await?;
+        let device_class = stream.read_u8().await?;
+        let device_subclass = stream.read_u8().await?;
+        let device_protocol = stream.read_u8().await?;
+        let configuration_value = stream.read_u8().await?;
+        let num_configurations = stream.read_u8().await?;
+        let num_interfaces = stream.read_u8().await?;
+        let interfaces: Vec<Interface> = vec![];
+
+        let device = Device {
+            path,
+            busid,
+            busnum,
+            devnum,
+            speed,
+            id_vendor,
+            id_product,
+            bcd_device,
+            device_class,
+            device_subclass,
+            device_protocol,
+            configuration_value,
+            num_configurations,
+            num_interfaces,
+            interfaces,
+        };
+
+        println!("Received {:?} response, status: {}, {:?}", UsbIpCommand::ReqImport, status, &device);
+
+        self.imported_device = Some(device);
 
         Ok(())
+    }
+
+    pub async fn cmd_submit(&mut self, mut cmd: UsbCommandSubmit) -> Result<UsbReturnSubmit, Error> {
+        let Some(stream) = &mut self.stream else {
+            return Err(Error::new(std::io::ErrorKind::NotConnected, "Not connected to USBIP server"));
+        };
+
+        let Some(device) = &self.imported_device else {
+            return Err(Error::new(std::io::ErrorKind::NotConnected, "Device not imported"));
+        };
+
+        println!("Sending {:?} Request", UsbIpCommand2::CmdSubmit);
+
+        let mut request = BytesMut::with_capacity(20);
+
+        cmd.header.command = UsbIpCommand2::CmdSubmit as u32;
+        cmd.header.devid = (device.busnum << 16) | device.devnum;
+        // request.put_u32(UsbIpCommand2::CmdSubmit as u32);
+        // request.put_u32(0); // seqnum
+        // request.put_u32(device.devnum); // devid
+        // request.put_u32(UsbIpDirection::UsbDirOut as u32); // direction
+        // request.put_u32(0); // ep number
+
+        // request.put_u32(UrbTransferFlags::DirMask.bits()); // transfer flags
+        // request.put_u32(0); // transfer buffer length
+        // request.put_u32(0); // start_frame ???
+        // request.put_u32(0); // number of packets
+        // request.put_u32(0); // interval
+        // request.put_u64(0); // setup bytes
+        // //ISO data
+
+        request.put(&cmd.to_bytes()[..]);
+
+        stream.write_all(&request).await?;
+        println!("Sent USBIP_CMD_SUBMIT request, length: {}", request.len());
+
+        let command = stream.read_u32().await?;
+
+        println!("Received USBIP_CMD_SUBMIT response, command: {:?}", command);
+        let seqnum = stream.read_u32().await?;
+        let devid = stream.read_u32().await?;
+        let direction = stream.read_u32().await?;
+        let ep_number = stream.read_u32().await?;
+
+        let status = stream.read_u32().await?; // status
+        println!("Received USBIP_CMD_SUBMIT response, status: {}", status);
+
+        let actual_length = stream.read_u32().await?;
+        let start_frame = stream.read_u32().await?;
+        let number_of_packets = stream.read_u32().await?;
+        let error_count = stream.read_u32().await?;
+        stream.read_u64().await?; // padding
+        let mut buf: Vec<u8> = vec![0; actual_length as usize];
+        stream.read(&mut buf[..]).await?;
+
+        let header = UsbCommandHeader {
+            command,
+            seqnum,
+            devid,
+            direction,
+            ep_number,
+        };
+
+        if status != 0 {
+            return Err(Error::new(std::io::ErrorKind::Other, format!("Failed to submit command, status: {}", status)));
+        }
+
+        Ok(UsbReturnSubmit {
+            header,
+            status,
+            actual_length,
+            start_frame,
+            number_of_packets,
+            error_count,
+            buffer: buf,
+        })
     }
 
     pub async fn disconnect(&mut self) {
