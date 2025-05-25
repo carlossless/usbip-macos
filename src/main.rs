@@ -1,9 +1,9 @@
-use std::{io::Error};
+use std::{io::Error, sync::{Arc}};
 
 use controller_interface::ControllerInterface;
 use dispatch2::dispatch_main;
-use tokio;
-use usbip::{connect_to_usbip_server, UsbIpClient};
+use tokio::{self, sync::Mutex};
+use usbip::{UsbIpClient};
 
 mod controller_interface;
 mod device;
@@ -146,8 +146,25 @@ fn main() {
 
     rt.block_on(client.connect(addr)).unwrap();
     rt.block_on(client.import_device(*device.get_busid())).unwrap();
+    let client = Arc::new(Mutex::new(client));
+    let clien_1 = Arc::clone(&client);
 
     let con_iface = ControllerInterface::new(client);
+    if let Err(e) = con_iface {
+        eprintln!("Error initializing controller interface: {}", e);
+        return;
+    }
+
+    rt.spawn(async move {
+        loop {
+            println!("Locking...");
+            let mut guard = clien_1.lock().await;
+            guard.poll().await;
+            drop(guard); // Explicitly drop the lock to avoid deadlocks
+            println!("Unlocked.");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    });
 
     dispatch_main();
 }
