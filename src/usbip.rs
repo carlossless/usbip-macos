@@ -1,8 +1,8 @@
-use std::{ffi::CStr, fmt::Debug, io::Error};
+use std::{collections::HashMap, ffi::CStr, fmt::Debug, io::Error, sync::{Arc, Mutex}};
 
 use bitflags::bitflags;
 use bytes::{Buf, BufMut, BytesMut};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::oneshot};
 
 const USBIP_VERSION: u16 = 273;
 
@@ -83,7 +83,8 @@ impl Debug for UsbIpCommand2 {
 }
 
 #[repr(u32)]
-enum UsbIpDirection {
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub enum UsbIpDirection {
     UsbDirOut = 0,
     UsbDirIn = 1,
 }
@@ -120,7 +121,7 @@ impl UsbCommandHeader {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        let mut buf = &bytes[..];
+        let mut buf = bytes;
         let command = buf.get_u32();
         let seqnum = buf.get_u32();
         let devid = buf.get_u32();
@@ -197,8 +198,8 @@ impl UsbCommandSubmit {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        let mut buf = &bytes[..];
-        let header = UsbCommandHeader::from_bytes(&buf[0..20]);
+        let header = UsbCommandHeader::from_bytes(&bytes[0..20]);
+        let mut buf = &bytes[20..];
         let transfer_flags = buf.get_u32();
         let transfer_buffer_length = buf.get_u32();
         let start_frame = buf.get_u32();
@@ -241,6 +242,30 @@ pub struct UsbReturnSubmit {
     number_of_packets: u32,
     error_count: u32,
     pub buffer: Vec<u8>,
+}
+
+impl UsbReturnSubmit {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let header = UsbCommandHeader::from_bytes(&bytes[0..20]);
+        let mut buf = &bytes[20..];
+        let status = buf.get_u32();
+        let actual_length = buf.get_u32();
+        let start_frame = buf.get_u32();
+        let number_of_packets = buf.get_u32();
+        let error_count = buf.get_u32();
+        buf.get_u64(); // skip padding
+        let buffer = buf.copy_to_bytes(actual_length as usize).to_vec();
+
+        UsbReturnSubmit {
+            header,
+            status,
+            actual_length,
+            start_frame,
+            number_of_packets,
+            error_count,
+            buffer,
+        }
+    }
 }
 
 impl Debug for UsbReturnSubmit {
@@ -289,12 +314,17 @@ impl Debug for Interface {
     }
 }
 
+type SharedMap = Arc<Mutex<HashMap<u32, oneshot::Sender<UsbReturnSubmit>>>>;
+
 pub struct UsbIpClient {
     stream: Option<TcpStream>,
     imported_device: Option<Device>,
     seqnum: u32,
-    pending_cmds: Vec<u32>, // secnum
+    pending: SharedMap,
 }
+
+unsafe impl Send for UsbIpClient {}
+unsafe impl Sync for UsbIpClient {}
 
 impl UsbIpClient {
     pub fn new() -> Self {
@@ -302,7 +332,7 @@ impl UsbIpClient {
             stream: None,
             imported_device: None,
             seqnum: 0,
-            pending_cmds: Vec::new(),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -492,71 +522,23 @@ impl UsbIpClient {
 
         request.put(&cmd.to_bytes()[..]);
 
-        self.pending_cmds.push(self.seqnum);
-
         stream.write_all(&request).await?;
-        println!("Sent USBIP_CMD_SUBMIT request, length: {}", request.len());
+        println!("Sent USBIP_CMD_SUBMIT request {:?}", cmd);
 
         Ok(cmd)
     }
 
     pub async fn cmd_submit_ret(&mut self, mut cmd: UsbCommandSubmit) -> Result<UsbReturnSubmit, Error> {
         cmd = self.cmd_submit(cmd).await?;
+        let (tx, rx) = oneshot::channel();
 
-        self.recv_ret_submit(Some(cmd.header.seqnum)).await
-    }
+        // Register the pending request
+        self.pending.lock().unwrap().insert(cmd.header.seqnum.clone(), tx);
 
-    pub async fn recv_ret_submit(&mut self, expected_seqnum: Option<u32>) -> Result<UsbReturnSubmit, Error> {
-        let Some(stream) = &mut self.stream else {
-            return Err(Error::new(std::io::ErrorKind::NotConnected, "Not connected to USBIP server"));
-        };
+        // Wait for the matching response
+        let response = rx.await.unwrap();
 
-        let command = stream.read_u32().await?;
-
-        println!("Received USBIP_CMD_SUBMIT response, command: {:?}", command);
-        let seqnum = stream.read_u32().await?;
-        let devid = stream.read_u32().await?;
-        let direction = stream.read_u32().await?;
-        let ep_number = stream.read_u32().await?;
-
-        let status = stream.read_u32().await?; // status
-        println!("Received USBIP_CMD_SUBMIT response, status: {}", status);
-
-        let actual_length = stream.read_u32().await?;
-        let start_frame = stream.read_u32().await?;
-        let number_of_packets = stream.read_u32().await?;
-        let error_count = stream.read_u32().await?;
-        stream.read_u64().await?; // padding
-        let mut buf: Vec<u8> = vec![0; actual_length as usize];
-        stream.read(&mut buf[..]).await?;
-
-        let header = UsbCommandHeader {
-            command,
-            seqnum,
-            devid,
-            direction,
-            ep_number,
-        };
-
-        if let Some(expected) = expected_seqnum {
-            if seqnum != expected {
-                return Err(Error::new(std::io::ErrorKind::InvalidData, format!("Unexpected sequence number: {}, expected: {}", seqnum, expected)));
-            }
-        }
-
-        if status != 0 {
-            return Err(Error::new(std::io::ErrorKind::Other, format!("Failed to submit command, status: {}", status)));
-        }
-
-        Ok(UsbReturnSubmit {
-            header,
-            status,
-            actual_length,
-            start_frame,
-            number_of_packets,
-            error_count,
-            buffer: buf,
-        })
+        Ok(response)
     }
 
     pub async fn poll(&mut self) -> bool {
@@ -571,9 +553,16 @@ impl UsbIpClient {
                 Ok(n) => {
                     println!("Received {} bytes from server", n);
                     let response = &buf[..n];
+                    let ret = UsbReturnSubmit::from_bytes(response);
+                    let secnum = ret.header.seqnum;
+                    if let Some(tx) = self.pending.lock().unwrap().remove(&secnum) {
+                        let _ = tx.send(ret);
+                    } else {
+                        eprintln!("Received response with unknown secnum: {}", secnum);
+                    }
                 }
                 Err(e) => {
-                    eprintln!("Error reading from stream: {}", e);
+                    // eprintln!("Error reading from stream: {}", e);
                     return false;
                 }
             }

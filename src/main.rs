@@ -1,6 +1,6 @@
-use std::{io::Error, sync::{Arc}};
+use std::{cell::{RefCell, UnsafeCell}, io::Error, ptr::NonNull, sync::Arc};
 
-use controller_interface::ControllerInterface;
+use controller_interface::{ControllerInterface, ForceableSend};
 use dispatch2::dispatch_main;
 use tokio::{self, sync::Mutex};
 use usbip::{UsbIpClient};
@@ -146,8 +146,8 @@ fn main() {
 
     rt.block_on(client.connect(addr)).unwrap();
     rt.block_on(client.import_device(*device.get_busid())).unwrap();
-    let client = Arc::new(Mutex::new(client));
-    let clien_1 = Arc::clone(&client);
+    let client = Arc::new(UnsafeCell::new(client));
+    let clien_1 = ForceableSend(Arc::clone(&client));
 
     let con_iface = ControllerInterface::new(client);
     if let Err(e) = con_iface {
@@ -156,12 +156,16 @@ fn main() {
     }
 
     rt.spawn(async move {
+        println!("Controller interface initialized successfully.");
+        let cl = clien_1;
         loop {
-            println!("Locking...");
-            let mut guard = clien_1.lock().await;
-            guard.poll().await;
-            drop(guard); // Explicitly drop the lock to avoid deadlocks
-            println!("Unlocked.");
+            // let mut guard = clien_1.lock().await;
+            unsafe {
+                // Get mutable reference to UsbIpClient and call poll if it exists
+                let client_ref = &mut *cl.0.get();
+                client_ref.poll().await;
+            }
+            // drop(guard); // Explicitly drop the lock to avoid deadlocks
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     });
