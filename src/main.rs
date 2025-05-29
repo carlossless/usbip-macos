@@ -40,7 +40,6 @@ fn main() {
         println!("Controller interface initialized successfully.");
         let cl = clien_1;
         loop {
-            // let mut guard = clien_1.lock().await;
             unsafe {
                 // Get mutable reference to UsbIpClient and call poll if it exists
                 let client_ref = &mut *cl.0.get();
@@ -49,8 +48,6 @@ fn main() {
                     process::exit(1);
                 }
             }
-            // drop(guard); // Explicitly drop the lock to avoid deadlocks
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     });
 

@@ -6,6 +6,8 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::oneshot};
 
 const USBIP_VERSION: u16 = 273;
 
+type UsbIpSeqnum = u32;
+
 bitflags! {
     /// Represents a set of flags.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -213,7 +215,7 @@ pub struct UsbReturnSubmit {
 }
 
 impl UsbReturnSubmit {
-    pub fn from_bytes(direction: u32, bytes: &[u8]) -> Self {
+    pub fn from_bytes(direction: UsbIpDirection, bytes: &[u8]) -> Self {
         let header = UsbCommandHeader::from_bytes(&bytes[0..20]);
         let mut buf = &bytes[20..];
         let status = buf.get_u32();
@@ -222,7 +224,7 @@ impl UsbReturnSubmit {
         let number_of_packets = buf.get_u32();
         let error_count = buf.get_u32();
         buf.get_u64(); // skip padding
-        let buffer = if direction == UsbIpDirection::UsbDirIn as u32 { buf.copy_to_bytes(actual_length as usize).to_vec() } else { vec![] };
+        let buffer = if direction == UsbIpDirection::UsbDirIn { buf.copy_to_bytes(actual_length as usize).to_vec() } else { vec![] };
 
         UsbReturnSubmit {
             header,
@@ -282,13 +284,11 @@ impl Debug for Interface {
     }
 }
 
-type SharedMap = Arc<Mutex<HashMap<u32, (u32, oneshot::Sender<UsbReturnSubmit>)>>>; // secnum, direction
-
 pub struct UsbIpClient {
     stream: Option<TcpStream>,
     imported_device: Option<Device>,
     seqnum: u32,
-    pending: SharedMap,
+    pending: Arc<Mutex<HashMap<UsbIpSeqnum, (UsbIpDirection, oneshot::Sender<UsbReturnSubmit>)>>>,
 }
 
 unsafe impl Send for UsbIpClient {}
@@ -505,7 +505,7 @@ impl UsbIpClient {
         let (tx, rx) = oneshot::channel();
 
         // Register the pending request
-        self.pending.lock().unwrap().insert(cmd.header.seqnum.clone(), (cmd.header.direction, tx));
+        self.pending.lock().unwrap().insert(cmd.header.seqnum.clone(), (direction, tx));
 
         // Wait for the matching response
         let response = rx.await.unwrap();
@@ -534,8 +534,6 @@ impl UsbIpClient {
                 }
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
-                        // No data available, just return
-                        return Ok(());
                     } else {
                         return Err(e);
                     }
