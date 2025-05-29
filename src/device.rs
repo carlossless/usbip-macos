@@ -1,5 +1,3 @@
-use core::panic;
-
 use objc2::rc::Retained;
 use objc2_io_usb_host::IOUSBHostCIDeviceStateMachine;
 
@@ -28,9 +26,5 @@ impl Device {
 
     pub fn get_endpoints(&self) -> &Vec<Endpoint> {
         &self.endpoints
-    }
-
-    pub fn get_endpoint_by_addr(&self) -> &Vec<Endpoint> {
-        panic!("Not implemented");
     }
 }

@@ -1,13 +1,17 @@
-use std::{borrow::BorrowMut, cell::{RefCell, UnsafeCell}, cmp::min, ffi::CStr, io::Error, mem, os::raw::c_void, ptr::{self, NonNull}, rc::Rc, slice::{from_raw_parts, from_raw_parts_mut}, sync::Arc, thread::sleep, time::Duration};
+use std::{borrow::BorrowMut, cell::{RefCell, UnsafeCell}, cmp::min, ffi::CStr, io::Error, mem, os::raw::c_void, ptr::NonNull, rc::Rc, slice::from_raw_parts_mut, sync::Arc};
 
 use block2::RcBlock;
 use dispatch2::run_on_main;
 use objc2::{rc::Retained, AnyThread};
 use objc2_foundation::{NSError, NSMutableData};
-use objc2_io_usb_host::{IOUSBHostCICapabilitiesMessageControlPortCountPhase, IOUSBHostCICapabilitiesMessageData0CommandTimeoutThresholdPhase, IOUSBHostCICapabilitiesMessageData0ConnectionLatencyPhase, IOUSBHostCICommandMessageData0DeviceAddress, IOUSBHostCICommandMessageData0DeviceAddressPhase, IOUSBHostCICommandMessageData0EndpointAddress, IOUSBHostCICommandMessageData0EndpointAddressPhase, IOUSBHostCIDeviceSpeed, IOUSBHostCIDeviceStateMachine, IOUSBHostCIDoorbell, IOUSBHostCIDoorbellDeviceAddress, IOUSBHostCIDoorbellDeviceAddressPhase, IOUSBHostCIDoorbellEndpointAddress, IOUSBHostCIDoorbellEndpointAddressPhase, IOUSBHostCIDoorbellStreamID, IOUSBHostCIDoorbellStreamIDPhase, IOUSBHostCIEndpointState, IOUSBHostCIEndpointStateMachine, IOUSBHostCILinkData1TransferStructureAddress, IOUSBHostCILinkState, IOUSBHostCIMessage, IOUSBHostCIMessageControlNoResponse, IOUSBHostCIMessageControlStatus, IOUSBHostCIMessageControlStatusPhase, IOUSBHostCIMessageControlType, IOUSBHostCIMessageControlTypePhase, IOUSBHostCIMessageControlValid, IOUSBHostCIMessageStatus, IOUSBHostCIMessageType, IOUSBHostCINormalTransferData0Length, IOUSBHostCINormalTransferData0LengthPhase, IOUSBHostCINormalTransferData1Buffer, IOUSBHostCINormalTransferData1BufferPhase, IOUSBHostCIPortCapabilitiesMessageControlConnectorTypePhase, IOUSBHostCIPortCapabilitiesMessageControlPortNumberPhase, IOUSBHostCIPortCapabilitiesMessageData0MaxPowerPhase, IOUSBHostCISetupTransferData1bRequest, IOUSBHostCISetupTransferData1bRequestPhase, IOUSBHostCISetupTransferData1bmRequestType, IOUSBHostCISetupTransferData1bmRequestTypePhase, IOUSBHostCISetupTransferData1wIndex, IOUSBHostCISetupTransferData1wIndexPhase, IOUSBHostCISetupTransferData1wLength, IOUSBHostCISetupTransferData1wLengthPhase, IOUSBHostCISetupTransferData1wValue, IOUSBHostCISetupTransferData1wValuePhase, IOUSBHostControllerInterface};
-use tokio::{runtime::Runtime, sync::Mutex};
+use objc2_io_usb_host::{IOUSBHostCICapabilitiesMessageControlPortCountPhase, IOUSBHostCICapabilitiesMessageData0CommandTimeoutThresholdPhase, IOUSBHostCICapabilitiesMessageData0ConnectionLatencyPhase, IOUSBHostCICommandMessageData0DeviceAddress, IOUSBHostCICommandMessageData0DeviceAddressPhase, IOUSBHostCICommandMessageData0EndpointAddress, IOUSBHostCICommandMessageData0EndpointAddressPhase, IOUSBHostCIDeviceSpeed, IOUSBHostCIDeviceStateMachine, IOUSBHostCIDoorbell, IOUSBHostCIDoorbellDeviceAddress, IOUSBHostCIDoorbellDeviceAddressPhase, IOUSBHostCIDoorbellEndpointAddress, IOUSBHostCIDoorbellEndpointAddressPhase, IOUSBHostCIDoorbellStreamID, IOUSBHostCIDoorbellStreamIDPhase, IOUSBHostCIEndpointState, IOUSBHostCIEndpointStateMachine,  IOUSBHostCILinkState, IOUSBHostCIMessage, IOUSBHostCIMessageControlNoResponse, IOUSBHostCIMessageControlStatus, IOUSBHostCIMessageControlStatusPhase, IOUSBHostCIMessageControlType, IOUSBHostCIMessageControlTypePhase, IOUSBHostCIMessageControlValid, IOUSBHostCIMessageStatus, IOUSBHostCIMessageType, IOUSBHostCINormalTransferData0Length, IOUSBHostCINormalTransferData0LengthPhase, IOUSBHostCINormalTransferData1Buffer, IOUSBHostCINormalTransferData1BufferPhase, IOUSBHostCIPortCapabilitiesMessageControlConnectorTypePhase, IOUSBHostCIPortCapabilitiesMessageControlPortNumberPhase, IOUSBHostCIPortCapabilitiesMessageData0MaxPowerPhase, IOUSBHostCISetupTransferData1bRequest, IOUSBHostCISetupTransferData1bRequestPhase, IOUSBHostCISetupTransferData1bmRequestType, IOUSBHostCISetupTransferData1bmRequestTypePhase, IOUSBHostCISetupTransferData1wIndex, IOUSBHostCISetupTransferData1wIndexPhase, IOUSBHostCISetupTransferData1wLength, IOUSBHostCISetupTransferData1wLengthPhase, IOUSBHostCISetupTransferData1wValue, IOUSBHostCISetupTransferData1wValuePhase, IOUSBHostControllerInterface};
+use tokio::runtime::Runtime;
 
-use crate::{device::Device, endpoint::Endpoint, usbip::{UrbTransferFlags, UsbCommandHeader, UsbCommandSubmit, UsbIpClient, UsbIpDirection}, UsbDesc, UsbDescConfiguration, UsbDescDevice, UsbDescInterface, UsbDescriptor, UsbDirection, UsbIface, UsbRecipient, UsbType};
+use crate::{device::Device, endpoint::Endpoint, usbip::{UrbTransferFlags, UsbIpClient, UsbIpDirection}};
+
+pub struct ForceableSend<T>(pub T);
+
+unsafe impl<T> Send for ForceableSend<T> {}
 
 pub struct ControllerInterface {
     control_interface: Retained<IOUSBHostControllerInterface>,
@@ -33,52 +37,9 @@ fn fnmut_to_fn3<T,U,V>(closure: impl FnMut(T, U, V)) -> impl Fn(T, U, V) {
     }
 }
 
-const DEVICE_DESC: UsbDescDevice = UsbDescDevice {
-    bLength: mem::size_of::<UsbDescDevice>() as u8,
-    bDescriptorType: UsbDescriptor::USB_DESC_DEVICE as u8,
-    bcdUSB: 0x0110, // USB 1.1
-    bDeviceClass: 0x00, // Per interface
-    bDeviceSubClass: 0x00, // Per interface
-    bDeviceProtocol: 0x00, // Per interface
-    bMaxPacketSize0: 8, // Can increase
-    idVendor: 0xdead,
-    idProduct: 0xbeef,
-    bcdDevice: 0x0000,
-    iManufacturer: 1,
-    iProduct: 2,
-    iSerialNumber: 3,
-    bNumConfigurations: 1,
-};
-
-const USB_DESC_INTERFACE_MAIN: UsbDescInterface = UsbDescInterface {
-    bLength: mem::size_of::<UsbDescInterface>() as u8,
-    bDescriptorType: UsbDescriptor::USB_DESC_INTERFACE as u8,
-    bInterfaceNumber: 0,
-    bAlternateSetting: 0,
-    bNumEndpoints: 1,
-    bInterfaceClass: UsbIface::USB_IFACE_CLASS_HID as u8,
-    bInterfaceSubClass: UsbIface::USB_IFACE_SUBCLASS_HID_BOOT as u8,
-    bInterfaceProtocol: 0 as u8, // lack enum
-    iInterface: 0,
-};
-
-const USB_DESC: UsbDesc = UsbDesc {
-    usb_desc: UsbDescConfiguration {
-        bLength: mem::size_of::<UsbDescConfiguration>() as u8,
-        bDescriptorType: UsbDescriptor::USB_DESC_CONFIGURATION as u8,
-        wTotalLength: 0,
-        bNumInterfaces: 1,
-        bConfigurationValue: 1,
-        iConfiguration: 0,
-        bmAttributes: 0x80, // Bus powered
-        bMaxPower: 50, // 100mA
-    },
-    usb_desc_interface: USB_DESC_INTERFACE_MAIN,
-};
-
 impl ControllerInterface {
     pub fn new(usbip_client: Arc<UnsafeCell<UsbIpClient>>) -> Result<Self, Error> {
-        let mut CAPABILITIES: IOUSBHostCIMessage = IOUSBHostCIMessage {
+        let mut capabilities: IOUSBHostCIMessage = IOUSBHostCIMessage {
             control: (IOUSBHostCIMessageType::ControllerCapabilities.0 << IOUSBHostCIMessageControlTypePhase)
                 | IOUSBHostCIMessageControlNoResponse
                 | IOUSBHostCIMessageControlValid
@@ -88,7 +49,7 @@ impl ControllerInterface {
             data1: 0,
         };
 
-        let mut PORT_CAPABILITIES: IOUSBHostCIMessage = IOUSBHostCIMessage {
+        let mut port_capabilities: IOUSBHostCIMessage = IOUSBHostCIMessage {
             control: (IOUSBHostCIMessageType::PortCapabilities.0 << IOUSBHostCIMessageControlTypePhase)
                 | IOUSBHostCIMessageControlNoResponse
                 | IOUSBHostCIMessageControlValid
@@ -124,8 +85,8 @@ impl ControllerInterface {
 
         let capabilities = unsafe {
             let data = NSMutableData::dataWithLength(0).unwrap();
-            data.appendBytes_length(NonNull::new_unchecked(&mut CAPABILITIES as *mut _ as *mut c_void), mem::size_of::<IOUSBHostCIMessage>());
-            data.appendBytes_length(NonNull::new_unchecked(&mut PORT_CAPABILITIES as *mut _ as *mut c_void), mem::size_of::<IOUSBHostCIMessage>());
+            data.appendBytes_length(NonNull::new_unchecked(&mut capabilities as *mut _ as *mut c_void), mem::size_of::<IOUSBHostCIMessage>());
+            data.appendBytes_length(NonNull::new_unchecked(&mut port_capabilities as *mut _ as *mut c_void), mem::size_of::<IOUSBHostCIMessage>());
             data
         };
 
@@ -169,7 +130,7 @@ fn command_handler(
     controller: NonNull<IOUSBHostControllerInterface>,
     command: IOUSBHostCIMessage,
     devices: &mut Vec<Device>,
-    client: Arc<UnsafeCell<UsbIpClient>>,
+    _client: Arc<UnsafeCell<UsbIpClient>>,
 ) {
     println!("Command handler called with command: {:?}", command);
     let msg_type = IOUSBHostCIMessageType((command.control & IOUSBHostCIMessageControlType) >> IOUSBHostCIMessageControlTypePhase);
@@ -280,7 +241,7 @@ fn command_handler(
         }
         IOUSBHostCIMessageType::DeviceCreate => {
             println!("DEVICE CREATE!");
-            let mut err: Option<Retained<NSError>> = None;
+            let err: Option<Retained<NSError>> = None;
 
             let dev = IOUSBHostCIDeviceStateMachine::alloc();
             let res = unsafe { IOUSBHostCIDeviceStateMachine::initWithInterface_command_error(dev, controller.as_ref(), NonNull::from(&command)) };
@@ -328,12 +289,12 @@ fn command_handler(
             println!("Device address: {:02x}, endpoint address: {:02x}", device_adress, endpoint_address);
 
             let dev = devices.iter().find(|dev| {
-                let address = unsafe { u8::try_from(dev.get_device_address()).unwrap() };
+                let address = u8::try_from(dev.get_device_address()).unwrap();
                 address == device_adress
             }).unwrap();
 
             let ep = dev.get_endpoints().iter().find(|ep| {
-                let address = unsafe { u8::try_from(ep.get_endpoint_address()).unwrap() };
+                let address = u8::try_from(ep.get_endpoint_address()).unwrap();
                 address == endpoint_address
             }).unwrap();
 
@@ -354,12 +315,12 @@ fn command_handler(
             let endpoint_address: u8 = u8::try_from((command.data0 & IOUSBHostCICommandMessageData0EndpointAddress) >> IOUSBHostCICommandMessageData0EndpointAddressPhase).unwrap();
 
             let dev = devices.iter().find(|dev| {
-                let address = unsafe { u8::try_from(dev.get_device_address()).unwrap() };
+                let address = u8::try_from(dev.get_device_address()).unwrap();
                 address == device_adress
             }).unwrap();
 
             let ep = dev.get_endpoints().iter().find(|ep| {
-                let address = unsafe { u8::try_from(ep.get_endpoint_address()).unwrap() };
+                let address = u8::try_from(ep.get_endpoint_address()).unwrap();
                 address == endpoint_address
             }).unwrap();
 
@@ -379,22 +340,17 @@ fn command_handler(
     }
 }
 
-pub struct ForceableSend<T>(pub T);
-
-unsafe impl<T> Send for ForceableSend<T> {}
-
-
 fn doorbell_handler(
-    controller: NonNull<IOUSBHostControllerInterface>,
-    doorbellArray: NonNull<IOUSBHostCIDoorbell>,
-    doorbellCount: u32,
+    _controller: NonNull<IOUSBHostControllerInterface>,
+    doorbell_array: NonNull<IOUSBHostCIDoorbell>,
+    doorbell_count: u32,
     devices: &mut Vec<Device>,
     client: Arc<UnsafeCell<UsbIpClient>>,
     rt: &Runtime,
 ) {
-    println!("Doorbell handler called with doorbell: {:?}", doorbellArray);
+    println!("Doorbell handler called with doorbell: {:?}", doorbell_array);
 
-    let doorbells = NonNull::slice_from_raw_parts(doorbellArray, doorbellCount as usize);
+    let doorbells = NonNull::slice_from_raw_parts(doorbell_array, doorbell_count as usize);
 
     for db in unsafe { doorbells.as_ref() } {
         let device_adress: u8 = u8::try_from((db & IOUSBHostCIDoorbellDeviceAddress) >> IOUSBHostCIDoorbellDeviceAddressPhase).unwrap();
@@ -443,12 +399,6 @@ fn doorbell_handler(
 
                 println!("Setup Transfer: requestType: {:02x}, request: {:02x}, value: {:02x}, index: {:02x}, length: {:02x}", request_type, request, value, index, length);
 
-                // if length == 0 {
-                //     panic!("Length is 0");
-                // }
-                // let dir = if (endpoint_address & 0x00000080) != 0 { 0 } else { 1 };
-                // // let dir = if (request_type & 0x80 as u8) != 0 { 1 } else { 0 };
-                // let flags = if (request_type & 0x80 as u8) != 0 { UrbTransferFlags::DirIn } else { UrbTransferFlags::DirOut };
 
                 let mut cl = Arc::clone(&client);
 
@@ -486,31 +436,23 @@ fn doorbell_handler(
                     // let dir = if (request_type & 0x80 as u8) != 0 { 1 } else { 0 };
                     let flags = if (request_type & 0x80 as u8) != 0 { UrbTransferFlags::DirIn } else { UrbTransferFlags::DirOut };
 
-                    let ep_ptr = ForceableSend(ep.clone());
-                    let client = ForceableSend(client.clone());
-
                     println!("Length: {}", data_length);
+                    let transfer_buffer = if flags == UrbTransferFlags::DirIn { vec![] } else { buffer.to_vec() };
 
                     let ret = rt.block_on(async {
                         println!("Submitting setup transfer...");
                         unsafe {
-                            cl.borrow_mut().get().as_mut().unwrap().cmd_submit_ret(UsbCommandSubmit::new(
-                                UsbCommandHeader::new(
-                                    1,
-                                    0,
-                                    0,
-                                    dir as u32,
-                                    (endpoint_address & 0x0f) as u32,
-                                ),
+                            cl.borrow_mut().get().as_mut().unwrap().cmd_submit(
+                                dir as UsbIpDirection,
+                                (endpoint_address & 0x0f) as u32,
                                 flags.bits(),
-                                // 0,
                                 length as u32,
                                 0,
                                 0,
                                 0,
                                 setup_bytes.to_le_bytes(),
-                                if flags == UrbTransferFlags::DirIn { vec![] } else { buffer.to_vec() },
-                            )).await
+                                &transfer_buffer,
+                            ).await
                         }
                     }).unwrap();
 
@@ -591,25 +533,20 @@ fn doorbell_handler(
                 let client = ForceableSend(client.clone());
 
                 rt.spawn(async move {
+                    let transfer_buffer = if dir == UsbIpDirection::UsbDirIn { vec![] } else { buffer.to_vec() };
                     let mut client = client;
                     let ret = unsafe {
-                        client.0.borrow_mut().get().as_mut().unwrap().cmd_submit_ret(UsbCommandSubmit::new(
-                            UsbCommandHeader::new(
-                                1,
-                                0,
-                                0,
-                                dir as u32,
-                                (endpoint_address & 0x0f) as u32,
-                                // endpoint_address as u32,
-                            ),
+                        client.0.borrow_mut().get().as_mut().unwrap().cmd_submit(
+                            dir as UsbIpDirection,
+                            (endpoint_address & 0x0f) as u32,
                             (if dir == UsbIpDirection::UsbDirIn { UrbTransferFlags::DirIn | UrbTransferFlags::NoTransferDmaMap } else { UrbTransferFlags::DirOut }).bits(),
                             data_length as u32,
                             0,
                             0,
                             1,
                             [0, 0, 0, 0, 0, 0, 0, 0],
-                            if dir == UsbIpDirection::UsbDirIn { vec![] } else { buffer.to_vec() },
-                        )).await
+                            &transfer_buffer,
+                        ).await
                     }.unwrap();
                     run_on_main(move |_| {
                         println!("Submit result: {:?}", ret);
@@ -627,7 +564,7 @@ fn doorbell_handler(
                         }
 
                         let ep_ptr = ep_ptr;
-                        let ep = unsafe { ep_ptr.0 };
+                        let ep = ep_ptr.0;
 
                         let res = unsafe { ep.enqueueTransferCompletionForMessage_status_transferLength_error(NonNull::from(msg), IOUSBHostCIMessageStatus::Success, data_length as usize) };
                         if res.is_err() {
@@ -669,177 +606,11 @@ fn doorbell_handler(
                         }
                     });
                 });
-                // panic!("done");
             }
             _ => {
                 panic!("Unknown message type {}", unsafe { CStr::from_ptr(msg_type.to_string()).to_str().unwrap() });
             }
         }
-    }
-}
-
-fn get_descriptor(
-    controller: &IOUSBHostControllerInterface,
-    ep: &IOUSBHostCIEndpointStateMachine,
-    value: u16,
-) {
-    let desc_type = (value >> 8) as u8;
-    let desc_index = (value & 0x00FF) as u8;
-
-    let scratch: &[u8];
-
-    let mut scratch_page: Vec<u8> = vec![];
-
-    match desc_type {
-        0x01 => {
-            println!("Device descriptor");
-            scratch = unsafe { from_raw_parts(&DEVICE_DESC as *const _ as *const u8, mem::size_of::<UsbDescDevice>()) };
-        }
-        0x02 => {
-            println!("Configuration descriptor");
-            scratch = unsafe { from_raw_parts(&USB_DESC as *const _ as *const u8, mem::size_of::<UsbDescConfiguration>()) };
-        }
-        0x03 => {
-            println!("String descriptor {:02x}", desc_index);
-
-            if desc_index == 0 {
-                scratch_page.resize(6, 0);
-                scratch_page[0] = 6;
-                scratch_page[1] = UsbDescriptor::USB_DESC_STRING as u8;
-                scratch_page[2] = 0x09; // Unicode
-                scratch_page[3] = 0x04; // English
-                scratch_page[4] = 0x00; // Language ID
-                scratch_page[5] = 0x00; // Language ID
-                scratch = &scratch_page;
-            } else {
-                let string = match desc_index {
-                    1 => "Carlosless Chedar",
-                    2 => "USBIP Device",
-                    3 => "1234567890",
-                    _ => panic!("Unknown string descriptor index: {}", desc_index),
-                };
-                let len = string.len() * 2 + 2;
-                scratch_page.resize(len, 0);
-                scratch_page[0] = string.len() as u8 * 2 + 2;
-                scratch_page[1] = UsbDescriptor::USB_DESC_STRING as u8;
-                scratch_page[2..].iter_mut().zip(string.as_bytes().iter().flat_map(|&b| [b, 0])).for_each(|(s, b)| *s = b);
-                scratch = &scratch_page;
-            }
-        }
-        _ => {
-            panic!("Unknown descriptor type: {:02x}", desc_type);
-        }
-    }
-
-    let res = unsafe { ep.enqueueTransferCompletionForMessage_status_transferLength_error(ep.currentTransferMessage(), IOUSBHostCIMessageStatus::Success, 0) }; // TODO: check if correct length
-    if res.is_err() {
-        panic!("Error: {:?}", res.err().unwrap());
-    }
-
-    if unsafe { ep.endpointState() } != IOUSBHostCIEndpointState::Active {
-        panic!("Endpoint is not active");
-    }
-
-    let msg = unsafe { ep.currentTransferMessage().as_ref() };
-    if (msg.control & IOUSBHostCIMessageControlValid) == 0 {
-        panic!("Message is not valid");
-    }
-
-    let msg_type = IOUSBHostCIMessageType((msg.control & IOUSBHostCIMessageControlType) >> IOUSBHostCIMessageControlTypePhase);
-    println!("MSG type: {}", unsafe { CStr::from_ptr(msg_type.to_string()).to_str().unwrap() });
-
-    if msg_type != IOUSBHostCIMessageType::NormalTransfer {
-        panic!("Message is not a normal transfer");
-    }
-
-    if msg.control & IOUSBHostCIMessageControlNoResponse != 0 {
-        panic!("Message should need a response");
-    }
-
-    let data_length: u32 = ((msg.data0 & IOUSBHostCINormalTransferData0Length) >> IOUSBHostCINormalTransferData0LengthPhase).try_into().unwrap();
-    let buffer: &mut [u8] = unsafe { from_raw_parts_mut(((msg.data1 & IOUSBHostCINormalTransferData1Buffer) >> IOUSBHostCINormalTransferData1BufferPhase) as *mut _, data_length as usize) };
-
-    let real_length = min(scratch.len(), data_length as usize);
-    if (real_length as u32) != data_length {
-        println!("WARN: Data length mismatch: {} != {}", real_length, data_length);
-    }
-
-    buffer[..real_length].copy_from_slice(&scratch[..real_length as usize]);
-
-    let res = unsafe { ep.enqueueTransferCompletionForMessage_status_transferLength_error(NonNull::from(msg), IOUSBHostCIMessageStatus::Success, data_length as usize) };
-    if res.is_err() {
-        panic!("Error: {:?}", res.err().unwrap());
-    }
-
-    let msg = unsafe { ep.currentTransferMessage().as_ref() };
-    if (msg.control & IOUSBHostCIMessageControlValid) == 0 {
-        panic!("Message is not valid");
-    }
-
-    let msg_type = IOUSBHostCIMessageType((msg.control & IOUSBHostCIMessageControlType) >> IOUSBHostCIMessageControlTypePhase);
-    println!("MSG type: {}", unsafe { CStr::from_ptr(msg_type.to_string()).to_str().unwrap() });
-
-    if msg_type != IOUSBHostCIMessageType::StatusTransfer {
-        panic!("Message is not a status transfer");
-    }
-
-    if msg.control & IOUSBHostCIMessageControlNoResponse != 0 {
-        panic!("Message should need a response");
-    }
-
-    let res = unsafe { ep.enqueueTransferCompletionForMessage_status_transferLength_error(NonNull::from(msg), IOUSBHostCIMessageStatus::Success, 0) };
-    if res.is_err() {
-        panic!("Error: {:?}", res.err().unwrap());
-    }
-}
-
-fn set_configuration(
-    controller: &IOUSBHostControllerInterface,
-    ep: &IOUSBHostCIEndpointStateMachine,
-    value: u16,
-) {
-    println!("Set configuration: {:02x}", value);
-
-    let msg = unsafe { ep.currentTransferMessage().as_ref() };
-    if (msg.control & IOUSBHostCIMessageControlValid) == 0 {
-        panic!("Message is not valid");
-    }
-
-    let msg_type = IOUSBHostCIMessageType((msg.control & IOUSBHostCIMessageControlType) >> IOUSBHostCIMessageControlTypePhase);
-    println!("MSG type: {}", unsafe { CStr::from_ptr(msg_type.to_string()).to_str().unwrap() });
-
-    if msg_type != IOUSBHostCIMessageType::SetupTransfer {
-        panic!("Message is not a setup transfer");
-    }
-
-    if msg.control & IOUSBHostCIMessageControlNoResponse != 0 {
-        panic!("Message should need a response");
-    }
-
-    let res = unsafe { ep.enqueueTransferCompletionForMessage_status_transferLength_error(NonNull::from(msg), IOUSBHostCIMessageStatus::Success, 0) };
-    if res.is_err() {
-        panic!("Error: {:?}", res.err().unwrap());
-    }
-
-    let msg = unsafe { ep.currentTransferMessage().as_ref() };
-    if (msg.control & IOUSBHostCIMessageControlValid) == 0 {
-        panic!("Message is not valid");
-    }
-
-    let msg_type = IOUSBHostCIMessageType((msg.control & IOUSBHostCIMessageControlType) >> IOUSBHostCIMessageControlTypePhase);
-    println!("MSG type: {}", unsafe { CStr::from_ptr(msg_type.to_string()).to_str().unwrap() });
-
-    if msg_type != IOUSBHostCIMessageType::StatusTransfer {
-        panic!("Message is not a status transfer");
-    }
-
-    if msg.control & IOUSBHostCIMessageControlNoResponse != 0 {
-        panic!("Message should need a response");
-    }
-
-    let res = unsafe { ep.enqueueTransferCompletionForMessage_status_transferLength_error(NonNull::from(msg), IOUSBHostCIMessageStatus::Success, 0) };
-    if res.is_err() {
-        panic!("Error: {:?}", res.err().unwrap());
     }
 }
 

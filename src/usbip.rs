@@ -19,8 +19,9 @@ bitflags! {
         const NoInterrupt      = 0x00000080; // yes     | yes       | yes      | yes
         const FreeBuffer       = 0x00000100; // yes     | yes       | yes      | yes
         const DirMask          = 0x00000200; // yes     | yes       | yes      | yes
-        const DirIn          = 0x00000200; 
-        const DirOut          = 0x00000000; 
+
+        const DirIn            = 0x00000200; 
+        const DirOut           = 0x00000000; 
     }
 }
 
@@ -110,16 +111,6 @@ impl Debug for UsbCommandHeader {
 }
 
 impl UsbCommandHeader {
-    pub fn new(command: u32, seqnum: u32, devid: u32, direction: u32, ep_number: u32) -> Self {
-        UsbCommandHeader {
-            command,
-            seqnum,
-            devid,
-            direction,
-            ep_number,
-        }
-    }
-
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let mut buf = bytes;
         let command = buf.get_u32();
@@ -185,29 +176,6 @@ impl UsbCommandSubmit {
         setup_bytes: [u8; 8],
         transfer_buffer: Vec<u8>,
     ) -> Self {
-        UsbCommandSubmit {
-            header,
-            transfer_flags,
-            transfer_buffer_length,
-            start_frame,
-            number_of_packets,
-            interval,
-            setup_bytes,
-            transfer_buffer,
-        }
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        let header = UsbCommandHeader::from_bytes(&bytes[0..20]);
-        let mut buf = &bytes[20..];
-        let transfer_flags = buf.get_u32();
-        let transfer_buffer_length = buf.get_u32();
-        let start_frame = buf.get_u32();
-        let number_of_packets = buf.get_u32();
-        let interval = buf.get_u32();
-        let setup_bytes = buf.copy_to_bytes(8).to_vec().try_into().unwrap();
-        let transfer_buffer = if header.direction == UsbIpDirection::UsbDirIn as u32 { buf.copy_to_bytes(transfer_buffer_length as usize).to_vec() } else { vec![] };
-
         UsbCommandSubmit {
             header,
             transfer_flags,
@@ -366,7 +334,7 @@ impl UsbIpClient {
         println!("Received USBIP_DEVLIST response, device count: {}", device_count);
 
         let mut devices: Vec<Device> = Vec::with_capacity(device_count as usize);
-        for d in 0..device_count {
+        for _d in 0..device_count {
             let mut path: [u8; 256] = [0; 256];
             let mut busid: [u8; 32] = [0; 32];
             stream.read_exact(&mut path).await?;
@@ -488,7 +456,18 @@ impl UsbIpClient {
         Ok(())
     }
 
-    pub async fn cmd_submit(&mut self, mut cmd: UsbCommandSubmit) -> Result<UsbCommandSubmit, Error> {
+    pub async fn cmd_submit(
+        &mut self,
+        direction: UsbIpDirection,
+        ep: u32,
+        transfer_flags: u32,
+        transfer_buffer_length: u32,
+        start_frame: u32,
+        number_of_packets: u32,
+        internal: u32,
+        setup_bytes: [u8; 8],
+        transfer_buffer: &[u8]
+    ) -> Result<UsbReturnSubmit, Error> {
         let Some(stream) = &mut self.stream else {
             return Err(Error::new(std::io::ErrorKind::NotConnected, "Not connected to USBIP server"));
         };
@@ -497,39 +476,32 @@ impl UsbIpClient {
             return Err(Error::new(std::io::ErrorKind::NotConnected, "Device not imported"));
         };
 
-        println!("Sending {:?} Request", UsbIpCommand2::CmdSubmit);
-
         self.seqnum = self.seqnum.wrapping_add(1);
 
-        let mut request = BytesMut::with_capacity(20);
+        let mut request = BytesMut::new();
 
-        cmd.header.command = UsbIpCommand2::CmdSubmit as u32;
-        cmd.header.devid = (device.busnum << 16) | device.devnum;
-        cmd.header.seqnum = self.seqnum;
-        // request.put_u32(UsbIpCommand2::CmdSubmit as u32);
-        // request.put_u32(0); // seqnum
-        // request.put_u32(device.devnum); // devid
-        // request.put_u32(UsbIpDirection::UsbDirOut as u32); // direction
-        // request.put_u32(0); // ep number
-
-        // request.put_u32(UrbTransferFlags::DirMask.bits()); // transfer flags
-        // request.put_u32(0); // transfer buffer length
-        // request.put_u32(0); // start_frame ???
-        // request.put_u32(0); // number of packets
-        // request.put_u32(0); // interval
-        // request.put_u64(0); // setup bytes
-        // //ISO data
+        let cmd = UsbCommandSubmit::new(
+            UsbCommandHeader {
+                command: UsbIpCommand2::CmdSubmit as u32,
+                seqnum: self.seqnum,
+                devid: (device.busnum << 16) | device.devnum,
+                direction: direction as u32,
+                ep_number: ep
+            },
+            transfer_flags,
+            transfer_buffer_length,
+            start_frame,
+            number_of_packets,
+            internal,
+            setup_bytes,
+            transfer_buffer.to_vec(),
+        );
 
         request.put(&cmd.to_bytes()[..]);
 
         stream.write_all(&request).await?;
         println!("Sent USBIP_CMD_SUBMIT request {:?}", cmd);
 
-        Ok(cmd)
-    }
-
-    pub async fn cmd_submit_ret(&mut self, mut cmd: UsbCommandSubmit) -> Result<UsbReturnSubmit, Error> {
-        cmd = self.cmd_submit(cmd).await?;
         let (tx, rx) = oneshot::channel();
 
         // Register the pending request
@@ -561,7 +533,6 @@ impl UsbIpClient {
                     }
                 }
                 Err(e) => {
-                    // eprintln!("Error reading from stream: {}", e);
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         // No data available, just return
                         return Ok(());
