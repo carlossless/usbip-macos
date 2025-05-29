@@ -434,46 +434,23 @@ fn doorbell_handler(
                     return;
                 }
 
-                let request_type: u8 = ((msg.data1 & IOUSBHostCISetupTransferData1bmRequestType) >> IOUSBHostCISetupTransferData1bmRequestTypePhase).try_into().unwrap();
-                let request: u8 = ((msg.data1 & IOUSBHostCISetupTransferData1bRequest) >> IOUSBHostCISetupTransferData1bRequestPhase).try_into().unwrap();
-                let value: u16 = ((msg.data1 & IOUSBHostCISetupTransferData1wValue) >> IOUSBHostCISetupTransferData1wValuePhase).try_into().unwrap();
-                let index: u16 = ((msg.data1 & IOUSBHostCISetupTransferData1wIndex) >> IOUSBHostCISetupTransferData1wIndexPhase).try_into().unwrap();
-                let length: u16 = ((msg.data1 & IOUSBHostCISetupTransferData1wLength) >> IOUSBHostCISetupTransferData1wLengthPhase).try_into().unwrap();
+                let setup_bytes = msg.data1;
+                let request_type: u8 = ((setup_bytes & IOUSBHostCISetupTransferData1bmRequestType) >> IOUSBHostCISetupTransferData1bmRequestTypePhase).try_into().unwrap();
+                let request: u8 = ((setup_bytes & IOUSBHostCISetupTransferData1bRequest) >> IOUSBHostCISetupTransferData1bRequestPhase).try_into().unwrap();
+                let value: u16 = ((setup_bytes & IOUSBHostCISetupTransferData1wValue) >> IOUSBHostCISetupTransferData1wValuePhase).try_into().unwrap();
+                let index: u16 = ((setup_bytes & IOUSBHostCISetupTransferData1wIndex) >> IOUSBHostCISetupTransferData1wIndexPhase).try_into().unwrap();
+                let length: u16 = ((setup_bytes & IOUSBHostCISetupTransferData1wLength) >> IOUSBHostCISetupTransferData1wLengthPhase).try_into().unwrap();
 
                 println!("Setup Transfer: requestType: {:02x}, request: {:02x}, value: {:02x}, index: {:02x}, length: {:02x}", request_type, request, value, index, length);
 
                 // if length == 0 {
                 //     panic!("Length is 0");
                 // }
-                let dir = if (endpoint_address & 0x00000080) != 0 { 0 } else { 1 };
-                // let dir = if (request_type & 0x80 as u8) != 0 { 1 } else { 0 };
-                let flags = if (request_type & 0x80 as u8) != 0 { UrbTransferFlags::DirIn } else { UrbTransferFlags::DirOut };
+                // let dir = if (endpoint_address & 0x00000080) != 0 { 0 } else { 1 };
+                // // let dir = if (request_type & 0x80 as u8) != 0 { 1 } else { 0 };
+                // let flags = if (request_type & 0x80 as u8) != 0 { UrbTransferFlags::DirIn } else { UrbTransferFlags::DirOut };
 
                 let mut cl = Arc::clone(&client);
-
-                let ret = rt.block_on(async {
-                    println!("Submitting setup transfer...");
-                    unsafe {
-                        cl.borrow_mut().get().as_mut().unwrap().cmd_submit_ret(UsbCommandSubmit::new(
-                            UsbCommandHeader::new(
-                                1,
-                                0,
-                                0,
-                                dir,
-                                (endpoint_address & 0x0f) as u32,
-                            ),
-                            flags.bits(),
-                            length as u32,
-                            0,
-                            0,
-                            0,
-                            msg.data1.to_le_bytes(),
-                            vec![],
-                        )).await
-                    }
-                }).unwrap();
-
-                println!("Submit result: {:?}", ret);
 
                 let ep = &ep.get_state_machine();
 
@@ -502,7 +479,42 @@ fn doorbell_handler(
                     let data_length: u32 = ((msg.data0 & IOUSBHostCINormalTransferData0Length) >> IOUSBHostCINormalTransferData0LengthPhase).try_into().unwrap();
                     let buffer: &mut [u8] = unsafe { from_raw_parts_mut(((msg.data1 & IOUSBHostCINormalTransferData1Buffer) >> IOUSBHostCINormalTransferData1BufferPhase) as *mut _, data_length as usize) };
 
+                    // let usbip_dir = if (endpoint_address & 0x80) != 0 { UsbIpDirection::UsbDirOut } else { UsbIpDirection::UsbDirIn };
+                    // let data_dir = if (request_type & 0x80) != 0 { UsbIpDirection::UsbDirIn } else { UsbIpDirection::UsbDirOut };
+
+                    let dir = if (request_type & 0x80) != 0 { UsbIpDirection::UsbDirIn } else { UsbIpDirection::UsbDirOut };
+                    // let dir = if (request_type & 0x80 as u8) != 0 { 1 } else { 0 };
+                    let flags = if (request_type & 0x80 as u8) != 0 { UrbTransferFlags::DirIn } else { UrbTransferFlags::DirOut };
+
+                    let ep_ptr = ForceableSend(ep.clone());
+                    let client = ForceableSend(client.clone());
+
                     println!("Length: {}", data_length);
+
+                    let ret = rt.block_on(async {
+                        println!("Submitting setup transfer...");
+                        unsafe {
+                            cl.borrow_mut().get().as_mut().unwrap().cmd_submit_ret(UsbCommandSubmit::new(
+                                UsbCommandHeader::new(
+                                    1,
+                                    0,
+                                    0,
+                                    dir as u32,
+                                    (endpoint_address & 0x0f) as u32,
+                                ),
+                                flags.bits(),
+                                // 0,
+                                length as u32,
+                                0,
+                                0,
+                                0,
+                                setup_bytes.to_le_bytes(),
+                                if flags == UrbTransferFlags::DirIn { vec![] } else { buffer.to_vec() },
+                            )).await
+                        }
+                    }).unwrap();
+
+                    println!("Submit result: {:?}", ret);
 
                     let real_length = min(ret.buffer.len(), data_length as usize);
                     if (real_length as u32) != data_length {
@@ -513,7 +525,6 @@ fn doorbell_handler(
                         println!("Copying data to buffer...");
                         buffer[..real_length].copy_from_slice(&ret.buffer[..real_length as usize]);
                     } else {
-                        println!("Copying data from buffer... NOT IMPLEMENTED");
                     }
 
                     let res = unsafe { ep.enqueueTransferCompletionForMessage_status_transferLength_error(NonNull::from(msg), IOUSBHostCIMessageStatus::Success, data_length as usize) };

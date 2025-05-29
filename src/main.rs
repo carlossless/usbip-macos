@@ -1,4 +1,4 @@
-use std::{cell::{RefCell, UnsafeCell}, io::Error, ptr::NonNull, sync::Arc};
+use std::{cell::{RefCell, UnsafeCell}, io::Error, process, ptr::NonNull, sync::Arc};
 
 use controller_interface::{ControllerInterface, ForceableSend};
 use dispatch2::dispatch_main;
@@ -163,7 +163,10 @@ fn main() {
             unsafe {
                 // Get mutable reference to UsbIpClient and call poll if it exists
                 let client_ref = &mut *cl.0.get();
-                client_ref.poll().await;
+                if let Err(error) =  client_ref.poll().await {
+                    eprintln!("Error polling USB/IP client: {}", error);
+                    process::exit(1);
+                }
             }
             // drop(guard); // Explicitly drop the lock to avoid deadlocks
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
