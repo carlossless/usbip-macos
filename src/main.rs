@@ -1,5 +1,6 @@
-use std::{cell::UnsafeCell, process, sync::Arc};
+use std::{cell::UnsafeCell, process::{self}, sync::Arc};
 
+use clap::{arg, Command};
 use controller_interface::{ControllerInterface, ForceableSend};
 use dispatch2::dispatch_main;
 use tokio;
@@ -13,28 +14,81 @@ mod usbip;
 
 // #[tokio::main]
 fn main() {
+    let matches = Command::new("usbip-darwin")
+        .about("USBIP client for darwin (macOS) systems")
+        .version(env!("CARGO_PKG_VERSION"))
+        .arg_required_else_help(true)
+        .author("Karolis Stasaitis")
+        .subcommand(
+            Command::new("bind")
+        )
+        .subcommand(
+            Command::new("list")
+        )
+        .arg(arg!(--host <HOST>).value_parser(clap::value_parser!(String))
+            .required(true).help("The host to connect to"))
+        .arg(arg!(-p --port <PORT>).value_parser(clap::value_parser!(u16))
+            .default_value("3240")
+            .help("The port to connect to"))
+        .get_matches();
+
+    let host = matches.get_one::<String>("host").unwrap();
+    let port = matches.get_one::<u16>("port").unwrap();
+
+    let addr = format!("{host}:{port}");
+
+    match matches.subcommand() {
+        Some(("bind", _)) => {
+            bind(&addr, 0).unwrap_or_else(|e| {
+                eprintln!("Error binding device: {}", e);
+                process::exit(1);
+            });
+        }
+        Some(("list", _)) => {
+            list(&addr).unwrap_or_else(|e| {
+                eprintln!("Error listing devices: {}", e);
+                process::exit(1);
+            });
+        }
+        _ => { panic!("Unknown command or no command provided") }
+    }
+
+}
+
+fn list(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    let mut client = UsbIpClient::new();
+    rt.block_on(client.connect(addr))?;
+    let devices = rt.block_on(client.list_devices())?;
+    
+    for device in devices {
+        println!("Device: {:?}", device);
+    }
+
+    Ok(())
+}
+
+fn bind(addr: &str, busid: u32) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
 
-    let addr = "carlossless-chedar:3240";
 
     let mut client = UsbIpClient::new();
-    rt.block_on(client.connect(addr)).unwrap();
+    rt.block_on(client.connect(&addr)).unwrap();
     let devices = rt.block_on(client.list_devices()).unwrap();
     let device = devices.first().unwrap();
 
-    rt.block_on(client.connect(addr)).unwrap();
+    rt.block_on(client.connect(&addr)).unwrap();
     rt.block_on(client.import_device(*device.get_busid())).unwrap();
     let client = Arc::new(UnsafeCell::new(client));
     let clien_1 = ForceableSend(Arc::clone(&client));
 
-    let con_iface = ControllerInterface::new(client);
-    if let Err(e) = con_iface {
-        eprintln!("Error initializing controller interface: {}", e);
-        return;
-    }
+    let _con_iface = ControllerInterface::new(client)?;
 
     rt.spawn(async move {
         println!("Controller interface initialized successfully.");
@@ -52,4 +106,6 @@ fn main() {
     });
 
     dispatch_main();
+
+    // Ok(())
 }
