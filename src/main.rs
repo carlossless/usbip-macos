@@ -1,10 +1,7 @@
 use std::{
     cell::UnsafeCell,
-    os::unix::thread,
     process::{self},
     sync::Arc,
-    thread::sleep,
-    time::Duration,
 };
 
 use clap::{arg, Command};
@@ -49,7 +46,7 @@ fn main() {
 
     match matches.subcommand() {
         Some(("attach", _)) => {
-            attach(&addr, 0).unwrap_or_else(|e| {
+            attach(&addr).unwrap_or_else(|e| {
                 eprintln!("Error attach device: {}", e);
                 process::exit(1);
             });
@@ -82,7 +79,7 @@ fn list(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn attach(addr: &str, busid: u32) -> Result<(), Box<dyn std::error::Error>> {
+fn attach(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -120,7 +117,6 @@ fn attach(addr: &str, busid: u32) -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Error polling USB/IP client: {}", error);
                     process::exit(1);
                 }
-                sleep(Duration::from_millis(10));
             }
         }
     });
