@@ -55,6 +55,14 @@ impl Device {
     pub fn get_busid(&self) -> &[u8; 32] {
         &self.busid
     }
+
+    pub fn get_id_vendor(&self) -> u16 {
+        self.id_vendor
+    }
+
+    pub fn get_id_product(&self) -> u16 {
+        self.id_product
+    }
 }
 
 #[repr(u16)]
@@ -464,7 +472,7 @@ impl UsbIpClient {
         transfer_buffer_length: u32,
         start_frame: u32,
         number_of_packets: u32,
-        internal: u32,
+        interval: u32,
         setup_bytes: [u8; 8],
         transfer_buffer: &[u8]
     ) -> Result<UsbReturnSubmit, Error> {
@@ -492,7 +500,7 @@ impl UsbIpClient {
             transfer_buffer_length,
             start_frame,
             number_of_packets,
-            internal,
+            interval,
             setup_bytes,
             transfer_buffer.to_vec(),
         );
