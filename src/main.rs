@@ -1,10 +1,17 @@
-use std::{cell::UnsafeCell, os::unix::thread, process::{self}, sync::Arc, thread::sleep, time::Duration};
+use std::{
+    cell::UnsafeCell,
+    os::unix::thread,
+    process::{self},
+    sync::Arc,
+    thread::sleep,
+    time::Duration,
+};
 
 use clap::{arg, Command};
 use controller_interface::{ControllerInterface, ForceableSend};
 use dispatch2::dispatch_main;
 use tokio;
-use usbip::{UsbIpClient};
+use usbip::UsbIpClient;
 
 mod controller_interface;
 mod device;
@@ -19,17 +26,20 @@ fn main() {
         .version(env!("CARGO_PKG_VERSION"))
         .arg_required_else_help(true)
         .author("Karolis Stasaitis")
-        .subcommand(
-            Command::new("attach")
+        .subcommand(Command::new("attach"))
+        .subcommand(Command::new("list"))
+        .arg(
+            arg!(--host <HOST>)
+                .value_parser(clap::value_parser!(String))
+                .required(true)
+                .help("The host to connect to"),
         )
-        .subcommand(
-            Command::new("list")
+        .arg(
+            arg!(-p --port <PORT>)
+                .value_parser(clap::value_parser!(u16))
+                .default_value("3240")
+                .help("The port to connect to"),
         )
-        .arg(arg!(--host <HOST>).value_parser(clap::value_parser!(String))
-            .required(true).help("The host to connect to"))
-        .arg(arg!(-p --port <PORT>).value_parser(clap::value_parser!(u16))
-            .default_value("3240")
-            .help("The port to connect to"))
         .get_matches();
 
     let host = matches.get_one::<String>("host").unwrap();
@@ -50,9 +60,10 @@ fn main() {
                 process::exit(1);
             });
         }
-        _ => { panic!("Unknown command or no command provided") }
+        _ => {
+            panic!("Unknown command or no command provided")
+        }
     }
-
 }
 
 fn list(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -63,7 +74,7 @@ fn list(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = UsbIpClient::new();
     rt.block_on(client.connect(addr))?;
     let devices = rt.block_on(client.list_devices())?;
-    
+
     for device in devices {
         println!("Device: {:?}", device);
     }
@@ -73,21 +84,26 @@ fn list(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 fn attach(addr: &str, busid: u32) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
+        .enable_all()
+        .build()
+        .unwrap();
 
     let mut client = UsbIpClient::new();
     rt.block_on(client.connect(&addr)).unwrap();
     let devices = rt.block_on(client.list_devices()).unwrap();
-    let device = devices.iter().find(|d| 
-        (d.get_id_vendor() == 0x05ac && d.get_id_product() == 0x024f) ||
-        (d.get_id_vendor() == 0x0603 && d.get_id_product() == 0x1020) // TODO: move into cli argument
-    ).unwrap();
+    let device = devices
+        .iter()
+        .find(
+            |d| {
+                (d.get_id_vendor() == 0x05ac && d.get_id_product() == 0x024f)
+                    || (d.get_id_vendor() == 0x0603 && d.get_id_product() == 0x1020)
+            }, // TODO: move into cli argument
+        )
+        .unwrap();
 
     rt.block_on(client.connect(&addr)).unwrap();
-    rt.block_on(client.import_device(*device.get_busid())).unwrap();
+    rt.block_on(client.import_device(*device.get_busid()))
+        .unwrap();
     let client = Arc::new(UnsafeCell::new(client));
     let clien_1 = ForceableSend(Arc::clone(&client));
 
@@ -100,7 +116,7 @@ fn attach(addr: &str, busid: u32) -> Result<(), Box<dyn std::error::Error>> {
             unsafe {
                 // Get mutable reference to UsbIpClient and call poll if it exists
                 let client_ref = &mut *cl.0.get();
-                if let Err(error) =  client_ref.poll().await {
+                if let Err(error) = client_ref.poll().await {
                     eprintln!("Error polling USB/IP client: {}", error);
                     process::exit(1);
                 }

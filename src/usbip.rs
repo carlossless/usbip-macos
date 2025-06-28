@@ -1,8 +1,18 @@
-use std::{collections::HashMap, ffi::CStr, fmt::Debug, io::Error, sync::{Arc, Mutex}};
+use std::{
+    collections::HashMap,
+    ffi::CStr,
+    fmt::Debug,
+    io::Error,
+    sync::{Arc, Mutex},
+};
 
 use bitflags::bitflags;
 use bytes::{Buf, BufMut, BytesMut};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::oneshot};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    sync::oneshot,
+};
 
 const USBIP_VERSION: u16 = 273;
 
@@ -22,8 +32,8 @@ bitflags! {
         const FreeBuffer       = 0x00000100; // yes     | yes       | yes      | yes
         const DirMask          = 0x00000200; // yes     | yes       | yes      | yes
 
-        const DirIn            = 0x00000200; 
-        const DirOut           = 0x00000000; 
+        const DirIn            = 0x00000200;
+        const DirOut           = 0x00000000;
     }
 }
 
@@ -68,7 +78,7 @@ impl Device {
 #[repr(u16)]
 enum UsbIpCommand {
     ReqDevlist = 0x8005,
-    ReqImport = 0x8003
+    ReqImport = 0x8003,
 }
 
 impl Debug for UsbIpCommand {
@@ -82,7 +92,7 @@ impl Debug for UsbIpCommand {
 
 #[repr(u32)]
 enum UsbIpCommand2 {
-    CmdSubmit = 0x00000001
+    CmdSubmit = 0x00000001,
 }
 
 impl Debug for UsbIpCommand2 {
@@ -170,7 +180,10 @@ impl Debug for UsbCommandSubmit {
             .field("number_of_packets", &self.number_of_packets)
             .field("interval", &self.interval)
             .field("setup_bytes", &self.setup_bytes)
-            .field("transfer_buffer", &format_args!("{:#04x?}", self.transfer_buffer))
+            .field(
+                "transfer_buffer",
+                &format_args!("{:#04x?}", self.transfer_buffer),
+            )
             .finish()
     }
 }
@@ -232,7 +245,11 @@ impl UsbReturnSubmit {
         let number_of_packets = buf.get_u32();
         let error_count = buf.get_u32();
         buf.get_u64(); // skip padding
-        let buffer = if direction == UsbIpDirection::UsbDirIn { buf.copy_to_bytes(actual_length as usize).to_vec() } else { vec![] };
+        let buffer = if direction == UsbIpDirection::UsbDirIn {
+            buf.copy_to_bytes(actual_length as usize).to_vec()
+        } else {
+            vec![]
+        };
 
         UsbReturnSubmit {
             header,
@@ -263,8 +280,12 @@ impl Debug for UsbReturnSubmit {
 impl Debug for Device {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Device")
-            .field("path", unsafe { &CStr::from_ptr(self.path.as_ptr() as *const i8) })
-            .field("busid", unsafe { &CStr::from_ptr(self.busid.as_ptr() as *const i8) })
+            .field("path", unsafe {
+                &CStr::from_ptr(self.path.as_ptr() as *const i8)
+            })
+            .field("busid", unsafe {
+                &CStr::from_ptr(self.busid.as_ptr() as *const i8)
+            })
             .field("busnum", &self.busnum)
             .field("devnum", &self.devnum)
             .field("speed", &self.speed)
@@ -320,7 +341,10 @@ impl UsbIpClient {
 
     pub async fn list_devices(&mut self) -> Result<Vec<Device>, Error> {
         if let None = self.stream {
-            return Err(Error::new(std::io::ErrorKind::NotConnected, "Not connected to USBIP server"));
+            return Err(Error::new(
+                std::io::ErrorKind::NotConnected,
+                "Not connected to USBIP server",
+            ));
         }
 
         println!("Sending {:?} Request", UsbIpCommand::ReqDevlist);
@@ -328,10 +352,10 @@ impl UsbIpClient {
         let stream = self.stream.as_mut().unwrap();
 
         let mut request = BytesMut::with_capacity(48);
-        request.put_u16(USBIP_VERSION);    // version
+        request.put_u16(USBIP_VERSION); // version
         request.put_u16(UsbIpCommand::ReqDevlist as u16); // command code
-        request.put_u32(0);      // status
-        request.resize(8, 0);   // pad to header size
+        request.put_u32(0); // status
+        request.resize(8, 0); // pad to header size
         stream.write_all(&request).await?;
 
         stream.read_u16().await?;
@@ -339,7 +363,10 @@ impl UsbIpClient {
         stream.read_u32().await?;
         let device_count = stream.read_u32().await?;
 
-        println!("Received USBIP_DEVLIST response, device count: {}", device_count);
+        println!(
+            "Received USBIP_DEVLIST response, device count: {}",
+            device_count
+        );
 
         let mut devices: Vec<Device> = Vec::with_capacity(device_count as usize);
         for _d in 0..device_count {
@@ -398,7 +425,10 @@ impl UsbIpClient {
 
     pub async fn import_device(&mut self, busid: [u8; 32]) -> Result<(), Error> {
         if let None = self.stream {
-            return Err(Error::new(std::io::ErrorKind::NotConnected, "Not connected to USBIP server"));
+            return Err(Error::new(
+                std::io::ErrorKind::NotConnected,
+                "Not connected to USBIP server",
+            ));
         }
 
         println!("Sending {:?} Request", UsbIpCommand::ReqImport);
@@ -406,19 +436,21 @@ impl UsbIpClient {
         let stream = self.stream.as_mut().unwrap();
 
         let mut request = BytesMut::with_capacity(48);
-        request.put_u16(USBIP_VERSION);    // version
+        request.put_u16(USBIP_VERSION); // version
         request.put_u16(UsbIpCommand::ReqImport as u16); // command code
-        request.put_u32(0);      // status
+        request.put_u32(0); // status
         request.put(&busid[..]);
-        request.resize(40, 0);   // pad to header size
+        request.resize(40, 0); // pad to header size
         stream.write_all(&request).await?;
-
 
         stream.read_u16().await?; // version
         stream.read_u16().await?; // reply code
         let status = stream.read_u32().await?;
         if status != 0 {
-            return Err(Error::new(std::io::ErrorKind::Other, "Failed to import device"));
+            return Err(Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to import device",
+            ));
         }
 
         let mut path: [u8; 256] = [0; 256];
@@ -457,7 +489,12 @@ impl UsbIpClient {
             interfaces,
         };
 
-        println!("Received {:?} response, status: {}, {:?}", UsbIpCommand::ReqImport, status, &device);
+        println!(
+            "Received {:?} response, status: {}, {:?}",
+            UsbIpCommand::ReqImport,
+            status,
+            &device
+        );
 
         self.imported_device = Some(device);
 
@@ -474,14 +511,20 @@ impl UsbIpClient {
         number_of_packets: u32,
         interval: u32,
         setup_bytes: [u8; 8],
-        transfer_buffer: &[u8]
+        transfer_buffer: &[u8],
     ) -> Result<UsbReturnSubmit, Error> {
         let Some(stream) = &mut self.stream else {
-            return Err(Error::new(std::io::ErrorKind::NotConnected, "Not connected to USBIP server"));
+            return Err(Error::new(
+                std::io::ErrorKind::NotConnected,
+                "Not connected to USBIP server",
+            ));
         };
 
         let Some(device) = &self.imported_device else {
-            return Err(Error::new(std::io::ErrorKind::NotConnected, "Device not imported"));
+            return Err(Error::new(
+                std::io::ErrorKind::NotConnected,
+                "Device not imported",
+            ));
         };
 
         self.seqnum = self.seqnum.wrapping_add(1);
@@ -494,7 +537,7 @@ impl UsbIpClient {
                 seqnum: self.seqnum,
                 devid: (device.busnum << 16) | device.devnum,
                 direction: direction as u32,
-                ep_number: ep
+                ep_number: ep,
             },
             transfer_flags,
             transfer_buffer_length,
@@ -513,7 +556,10 @@ impl UsbIpClient {
         let (tx, rx) = oneshot::channel();
 
         // Register the pending request
-        self.pending.lock().unwrap().insert(cmd.header.seqnum.clone(), (direction, tx));
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(cmd.header.seqnum.clone(), (direction, tx));
 
         // Wait for the matching response
         let response = rx.await.unwrap();
@@ -523,11 +569,14 @@ impl UsbIpClient {
 
     pub async fn poll(&mut self) -> Result<(), Error> {
         if let Some(stream) = &self.stream {
-            let mut buf : [u8; 4096] = [0; 4096];
+            let mut buf: [u8; 4096] = [0; 4096];
             let s = stream.try_read(&mut buf);
             match s {
                 Ok(0) => {
-                    return Err(Error::new(std::io::ErrorKind::ConnectionAborted, "Connection closed by server"));
+                    return Err(Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "Connection closed by server",
+                    ));
                 }
                 Ok(n) => {
                     println!("Received {} bytes from server", n);

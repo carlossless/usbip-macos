@@ -7,9 +7,7 @@ pub struct Endpoint {
 
 impl Endpoint {
     pub fn new(state_machine: Retained<IOUSBHostCIEndpointStateMachine>) -> Self {
-        Endpoint {
-            state_machine,
-        }
+        Endpoint { state_machine }
     }
 
     pub fn get_endpoint_address(&self) -> usize {
