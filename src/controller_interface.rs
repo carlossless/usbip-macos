@@ -539,11 +539,11 @@ fn doorbell_handler(
                         client.0.borrow_mut().get().as_mut().unwrap().cmd_submit(
                             dir as UsbIpDirection,
                             (endpoint_address & 0x0f) as u32,
-                            (if dir == UsbIpDirection::UsbDirIn { UrbTransferFlags::DirIn | UrbTransferFlags::NoTransferDmaMap } else { UrbTransferFlags::DirOut }).bits(),
+                            (if dir == UsbIpDirection::UsbDirIn { UrbTransferFlags::DirIn } else { UrbTransferFlags::DirOut }).bits(),
                             data_length as u32,
                             0,
                             0,
-                            1,
+                            0, 
                             [0, 0, 0, 0, 0, 0, 0, 0],
                             &transfer_buffer,
                         ).await
