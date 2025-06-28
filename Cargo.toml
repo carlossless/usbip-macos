@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-objc2 = { git = "ssh://git@github.com/carlossless/objc2.git", branch = "fix/objc2-io-usb-host"}
+objc2 = { git = "ssh://git@github.com/carlossless/objc2.git", branch = "fix/objc2-io-usb-host", features = ["relax-sign-encoding"] } # https://github.com/madsmtm/objc2/issues/754
 block2 = { git = "ssh://git@github.com/carlossless/objc2.git", branch = "fix/objc2-io-usb-host" }
 dispatch2 = { git = "ssh://git@github.com/carlossless/objc2.git", branch = "fix/objc2-io-usb-host" }
 objc2-foundation = { git = "ssh://git@github.com/carlossless/objc2.git", branch = "fix/objc2-io-usb-host" }
