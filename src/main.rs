@@ -1,4 +1,4 @@
-use std::{cell::UnsafeCell, process::{self}, sync::Arc};
+use std::{cell::UnsafeCell, os::unix::thread, process::{self}, sync::Arc, thread::sleep, time::Duration};
 
 use clap::{arg, Command};
 use controller_interface::{ControllerInterface, ForceableSend};
@@ -20,7 +20,7 @@ fn main() {
         .arg_required_else_help(true)
         .author("Karolis Stasaitis")
         .subcommand(
-            Command::new("bind")
+            Command::new("attach")
         )
         .subcommand(
             Command::new("list")
@@ -38,9 +38,9 @@ fn main() {
     let addr = format!("{host}:{port}");
 
     match matches.subcommand() {
-        Some(("bind", _)) => {
-            bind(&addr, 0).unwrap_or_else(|e| {
-                eprintln!("Error binding device: {}", e);
+        Some(("attach", _)) => {
+            attach(&addr, 0).unwrap_or_else(|e| {
+                eprintln!("Error attach device: {}", e);
                 process::exit(1);
             });
         }
@@ -71,7 +71,7 @@ fn list(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn bind(addr: &str, busid: u32) -> Result<(), Box<dyn std::error::Error>> {
+fn attach(addr: &str, busid: u32) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -81,7 +81,10 @@ fn bind(addr: &str, busid: u32) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = UsbIpClient::new();
     rt.block_on(client.connect(&addr)).unwrap();
     let devices = rt.block_on(client.list_devices()).unwrap();
-    let device = devices.first().unwrap();
+    let device = devices.iter().find(|d| 
+        (d.get_id_vendor() == 0x05ac && d.get_id_product() == 0x024f) ||
+        (d.get_id_vendor() == 0x0603 && d.get_id_product() == 0x1020) // TODO: move into cli argument
+    ).unwrap();
 
     rt.block_on(client.connect(&addr)).unwrap();
     rt.block_on(client.import_device(*device.get_busid())).unwrap();
@@ -101,6 +104,7 @@ fn bind(addr: &str, busid: u32) -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Error polling USB/IP client: {}", error);
                     process::exit(1);
                 }
+                sleep(Duration::from_millis(10));
             }
         }
     });
