@@ -37,10 +37,9 @@ use objc2_io_usb_host::{
     IOUSBHostCIPortCapabilitiesMessageControlPortNumberPhase,
     IOUSBHostCIPortCapabilitiesMessageData0MaxPowerPhase, IOUSBHostCISetupTransferData1bRequest,
     IOUSBHostCISetupTransferData1bRequestPhase, IOUSBHostCISetupTransferData1bmRequestType,
-    IOUSBHostCISetupTransferData1bmRequestTypePhase,
-    IOUSBHostCISetupTransferData1wIndexPhase,
+    IOUSBHostCISetupTransferData1bmRequestTypePhase, IOUSBHostCISetupTransferData1wIndexPhase,
     IOUSBHostCISetupTransferData1wLengthPhase, IOUSBHostCISetupTransferData1wValue,
-    IOUSBHostCISetupTransferData1wValuePhase, IOUSBHostControllerInterface
+    IOUSBHostCISetupTransferData1wValuePhase, IOUSBHostControllerInterface,
 };
 use tokio::runtime::Runtime;
 
