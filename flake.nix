@@ -2,11 +2,11 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
     utils.url = "github:numtide/flake-utils";
-    naersk.url = "github:nix-community/naersk";
+    crane.url = "github:ipetkov/crane";
     rust-overlay.url = "github:oxalica/rust-overlay";
   };
 
-  outputs = { self, nixpkgs, utils, naersk, rust-overlay }:
+  outputs = { self, nixpkgs, utils, crane, rust-overlay }:
     utils.lib.eachDefaultSystem (
       system:
       let
@@ -16,47 +16,38 @@
           inherit system overlays;
         };
 
-        toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        craneLib = (crane.mkLib pkgs).overrideToolchain (p: p.rust-bin.stable.latest.default);
 
-        naersk' = pkgs.callPackage naersk {
-          cargo = toolchain;
-          rustc = toolchain;
-          clippy = toolchain;
+        # Common arguments can be set here to avoid repeating them later
+        # Note: changes here will rebuild all dependency crates
+        commonArgs = {
+          src = craneLib.cleanCargoSource ./.;
+          strictDeps = true;
+
+          buildInputs =
+            [
+              pkgs.apple-sdk
+            ];
         };
 
-        buildInputs = with pkgs; [
-          apple-sdk
-        ];
+        usbip-macos = craneLib.buildPackage (
+          commonArgs
+          // {
+            cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          }
+        );
       in
       {
         formatter = pkgs.nixpkgs-fmt;
 
-        packages = {
-          # For `nix build` `nix run`, & `nix profile install`:
-          default = naersk'.buildPackage {
-            pname = "usbip-macos";
-            version = "latest";
-
-            src = ./.;
-
-            doCheck = false; # integration tests from running since they require an attached specific device
-
-            inherit buildInputs;
-
-            meta = with pkgs.lib; {
-              description = "A USB/IP client for macOS";
-              homepage = "https://github.com/carlossless/usbip-macos";
-              license = licenses.mit;
-              mainProgram = "usbip-macos";
-              maintainers = with maintainers; [ carlossless ];
-              platforms = platforms.darwin;
-            };
-          };
+        checks = {
+          inherit usbip-macos;
         };
 
-        devShells.default = pkgs.mkShell {
-          inherit buildInputs;
-          nativeBuildInputs = with pkgs; [ rustup toolchain ];
+        packages.default = usbip-macos;
+
+        devShells.default = craneLib.devShell {
+          checks = self.checks.${system};
         };
       }
     );

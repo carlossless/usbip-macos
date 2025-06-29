@@ -2,7 +2,7 @@ use std::{
     borrow::BorrowMut,
     cell::{RefCell, UnsafeCell},
     cmp::min,
-    ffi::CStr,
+    ffi::{c_ulong, CStr},
     io::Error,
     mem,
     os::raw::c_void,
@@ -37,10 +37,10 @@ use objc2_io_usb_host::{
     IOUSBHostCIPortCapabilitiesMessageControlPortNumberPhase,
     IOUSBHostCIPortCapabilitiesMessageData0MaxPowerPhase, IOUSBHostCISetupTransferData1bRequest,
     IOUSBHostCISetupTransferData1bRequestPhase, IOUSBHostCISetupTransferData1bmRequestType,
-    IOUSBHostCISetupTransferData1bmRequestTypePhase, IOUSBHostCISetupTransferData1wIndex,
-    IOUSBHostCISetupTransferData1wIndexPhase, IOUSBHostCISetupTransferData1wLength,
+    IOUSBHostCISetupTransferData1bmRequestTypePhase,
+    IOUSBHostCISetupTransferData1wIndexPhase,
     IOUSBHostCISetupTransferData1wLengthPhase, IOUSBHostCISetupTransferData1wValue,
-    IOUSBHostCISetupTransferData1wValuePhase, IOUSBHostControllerInterface,
+    IOUSBHostCISetupTransferData1wValuePhase, IOUSBHostControllerInterface
 };
 use tokio::runtime::Runtime;
 
@@ -49,6 +49,17 @@ use crate::{
     endpoint::Endpoint,
     usbip::{UrbTransferFlags, UsbIpClient, UsbIpDirection},
 };
+
+// These constants are not prosent in objc2-io-usb-host, so we define them here https://github.com/madsmtm/objc2/issues/753
+macro_rules! IOUSBBitRange {
+    ($start:expr, $end:expr) => {
+        !((1 << $start) - 1) & ((1 << $end) | ((1 << $end) - 1))
+    };
+}
+#[allow(non_upper_case_globals)]
+pub const IOUSBHostCISetupTransferData1wIndex: c_ulong = IOUSBBitRange!(32, 47);
+#[allow(non_upper_case_globals)]
+pub const IOUSBHostCISetupTransferData1wLength: c_ulong = IOUSBBitRange!(48, 63);
 
 pub struct ForceableSend<T>(pub T);
 
@@ -273,14 +284,12 @@ fn command_handler(
         IOUSBHostCIMessageType::PortPowerOn => {
             println!("PORT POWAH!");
 
-            let mut err: Option<Retained<NSError>> = None;
-
             let res = unsafe {
                 controller
                     .as_ref()
-                    .getPortStateMachineForCommand_error(NonNull::from(&command), Some(&mut err))
+                    .getPortStateMachineForCommand_error(NonNull::from(&command))
             };
-            if res.is_none() {
+            if let Err(err) = res {
                 panic!("Error: {:?}", err);
             }
 
@@ -303,14 +312,13 @@ fn command_handler(
         }
         IOUSBHostCIMessageType::PortStatus => {
             println!("PORT STATUS!");
-            let mut err: Option<Retained<NSError>> = None;
 
             let res = unsafe {
                 controller
                     .as_ref()
-                    .getPortStateMachineForCommand_error(NonNull::from(&command), Some(&mut err))
+                    .getPortStateMachineForCommand_error(NonNull::from(&command))
             };
-            if res.is_none() {
+            if let Err(err) = res {
                 panic!("Error: {:?}", err);
             }
 
@@ -331,14 +339,13 @@ fn command_handler(
         }
         IOUSBHostCIMessageType::PortReset => {
             println!("PORT RESET!");
-            let mut err: Option<Retained<NSError>> = None;
 
             let res = unsafe {
                 controller
                     .as_ref()
-                    .getPortStateMachineForCommand_error(NonNull::from(&command), Some(&mut err))
+                    .getPortStateMachineForCommand_error(NonNull::from(&command))
             };
-            if res.is_none() {
+            if let Err(err) = res {
                 panic!("Error: {:?}", err);
             }
 
@@ -355,7 +362,7 @@ fn command_handler(
                     false,
                 )
             };
-            if res.is_err() {
+            if let Err(err) = res {
                 panic!("Error: {:?}", err);
             }
 

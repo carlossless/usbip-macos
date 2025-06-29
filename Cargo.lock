@@ -97,7 +97,7 @@ checksum = "1b8e56985ec62d17e9c1001dc89c88ecd7dc08e47eba5ec7c29c7b5eeecde967"
 [[package]]
 name = "block2"
 version = "0.6.1"
-source = "git+ssh://git@github.com/carlossless/objc2.git?branch=fix%2Fobjc2-io-usb-host#5e415d708796d593adc9d7aa47cd5653e8ecc6e0"
+source = "git+https://github.com/madsmtm/objc2.git?branch=master#a63e4ef84b2b7054809e1b8fab2687662e719968"
 dependencies = [
  "objc2",
 ]
@@ -159,7 +159,7 @@ checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
 [[package]]
 name = "dispatch2"
 version = "0.3.0"
-source = "git+ssh://git@github.com/carlossless/objc2.git?branch=fix%2Fobjc2-io-usb-host#5e415d708796d593adc9d7aa47cd5653e8ecc6e0"
+source = "git+https://github.com/madsmtm/objc2.git?branch=master#a63e4ef84b2b7054809e1b8fab2687662e719968"
 dependencies = [
  "bitflags",
  "block2",
@@ -233,7 +233,7 @@ dependencies = [
 [[package]]
 name = "objc2"
 version = "0.6.1"
-source = "git+ssh://git@github.com/carlossless/objc2.git?branch=fix%2Fobjc2-io-usb-host#5e415d708796d593adc9d7aa47cd5653e8ecc6e0"
+source = "git+https://github.com/madsmtm/objc2.git?branch=master#a63e4ef84b2b7054809e1b8fab2687662e719968"
 dependencies = [
  "objc2-encode",
 ]
@@ -241,7 +241,7 @@ dependencies = [
 [[package]]
 name = "objc2-core-foundation"
 version = "0.3.1"
-source = "git+ssh://git@github.com/carlossless/objc2.git?branch=fix%2Fobjc2-io-usb-host#5e415d708796d593adc9d7aa47cd5653e8ecc6e0"
+source = "git+https://github.com/madsmtm/objc2.git?branch=master#a63e4ef84b2b7054809e1b8fab2687662e719968"
 dependencies = [
  "bitflags",
  "dispatch2",
@@ -251,12 +251,12 @@ dependencies = [
 [[package]]
 name = "objc2-encode"
 version = "4.1.0"
-source = "git+ssh://git@github.com/carlossless/objc2.git?branch=fix%2Fobjc2-io-usb-host#5e415d708796d593adc9d7aa47cd5653e8ecc6e0"
+source = "git+https://github.com/madsmtm/objc2.git?branch=master#a63e4ef84b2b7054809e1b8fab2687662e719968"
 
 [[package]]
 name = "objc2-foundation"
 version = "0.3.1"
-source = "git+ssh://git@github.com/carlossless/objc2.git?branch=fix%2Fobjc2-io-usb-host#5e415d708796d593adc9d7aa47cd5653e8ecc6e0"
+source = "git+https://github.com/madsmtm/objc2.git?branch=master#a63e4ef84b2b7054809e1b8fab2687662e719968"
 dependencies = [
  "bitflags",
  "block2",
@@ -268,7 +268,7 @@ dependencies = [
 [[package]]
 name = "objc2-io-kit"
 version = "0.3.1"
-source = "git+ssh://git@github.com/carlossless/objc2.git?branch=fix%2Fobjc2-io-usb-host#5e415d708796d593adc9d7aa47cd5653e8ecc6e0"
+source = "git+https://github.com/madsmtm/objc2.git?branch=master#a63e4ef84b2b7054809e1b8fab2687662e719968"
 dependencies = [
  "dispatch2",
  "libc",
@@ -279,7 +279,7 @@ dependencies = [
 [[package]]
 name = "objc2-io-usb-host"
 version = "0.3.1"
-source = "git+ssh://git@github.com/carlossless/objc2.git?branch=fix%2Fobjc2-io-usb-host#5e415d708796d593adc9d7aa47cd5653e8ecc6e0"
+source = "git+https://github.com/madsmtm/objc2.git?branch=master#a63e4ef84b2b7054809e1b8fab2687662e719968"
 dependencies = [
  "bitflags",
  "block2",
