@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
     utils.url = "github:numtide/flake-utils";
     naersk.url = "github:nix-community/naersk";
     rust-overlay.url = "github:oxalica/rust-overlay";
@@ -25,18 +25,8 @@
         };
 
         buildInputs = with pkgs; [
-          pkg-config
-          libusb1
-          binutils
-        ] ++
-        (lib.optionals (stdenv.hostPlatform.isLinux) [
-          udev
-        ]) ++
-        (lib.optionals (stdenv.hostPlatform.isDarwin) [
-          darwin.apple_sdk.frameworks.IOKit
-          darwin.apple_sdk.frameworks.AppKit
-          iconv
-        ]);
+          apple-sdk
+        ];
       in
       {
         formatter = pkgs.nixpkgs-fmt;
@@ -59,6 +49,7 @@
               license = licenses.mit;
               mainProgram = "usbip-macos";
               maintainers = with maintainers; [ carlossless ];
+              platforms = platforms.darwin;
             };
           };
         };
