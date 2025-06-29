@@ -44,7 +44,7 @@
         packages = {
           # For `nix build` `nix run`, & `nix profile install`:
           default = naersk'.buildPackage {
-            pname = "usbip-darwin";
+            pname = "usbip-macos";
             version = "latest";
 
             src = ./.;
@@ -55,9 +55,9 @@
 
             meta = with pkgs.lib; {
               description = "A USB/IP client for macOS";
-              homepage = "https://github.com/carlossless/usbip-darwin";
+              homepage = "https://github.com/carlossless/usbip-macos";
               license = licenses.mit;
-              mainProgram = "usbip-darwin";
+              mainProgram = "usbip-macos";
               maintainers = with maintainers; [ carlossless ];
             };
           };
