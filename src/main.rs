@@ -107,7 +107,12 @@ fn list(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn attach(addr: &str, busid: Option<String>, vendor_id: Option<u16>, product_id: Option<u16>) -> Result<(), Box<dyn std::error::Error>> {
+fn attach(
+    addr: &str,
+    busid: Option<String>,
+    vendor_id: Option<u16>,
+    product_id: Option<u16>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
