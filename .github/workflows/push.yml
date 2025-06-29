@@ -54,7 +54,7 @@ jobs:
     needs: test
     runs-on: macos-latest
     env:
-      NAME: darwin-usbip
+      NAME: usbip-macos
     steps:
       - uses: actions/checkout@v4
       - name: Cargo cache
