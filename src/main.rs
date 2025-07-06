@@ -8,6 +8,7 @@ use clap::{arg, Command};
 use clap_num::maybe_hex;
 use controller_interface::{ControllerInterface, ForceableSend};
 use dispatch2::dispatch_main;
+use simple_logger::SimpleLogger;
 use tokio;
 use usbip::UsbIpClient;
 
@@ -19,6 +20,18 @@ mod usbip;
 
 // #[tokio::main]
 fn main() {
+    #[cfg(debug_assertions)]
+    let default_log_level = log::LevelFilter::Debug;
+    #[cfg(not(debug_assertions))]
+    let default_log_level = log::LevelFilter::Off;
+
+    SimpleLogger::new()
+        .with_utc_timestamps()
+        .with_level(default_log_level)
+        .env()
+        .init()
+        .unwrap();
+
     let matches = Command::new("usbip-macos")
         .about("USBIP client for macOS systems")
         .version(env!("CARGO_PKG_VERSION"))
@@ -132,12 +145,6 @@ fn attach(
                 false
             }
         })
-        // .find(
-        //     |d| {
-        //         (d.get_id_vendor() == 0x05ac && d.get_id_product() == 0x024f)
-        //             || (d.get_id_vendor() == 0x0603 && d.get_id_product() == 0x1020)
-        //     }, // TODO: move into cli argument
-        // )
         .unwrap();
 
     rt.block_on(client.connect(&addr)).unwrap();

@@ -14,6 +14,7 @@ use std::{
 
 use block2::RcBlock;
 use dispatch2::run_on_main;
+use log::{debug, error};
 use objc2::{rc::Retained, AnyThread};
 use objc2_foundation::{NSError, NSMutableData};
 use objc2_io_usb_host::{
@@ -169,9 +170,8 @@ impl ControllerInterface {
 
         if interface.is_none() {
             unsafe {
-                println!("Failed to create IOUSBHostControllerInterface");
-                println!("Error: {:?}", error);
-                println!(
+                error!("Failed to create IOUSBHostControllerInterface");
+                error!(
                     "Error: {:?}",
                     error.as_ref().unwrap().localizedFailureReason().unwrap()
                 );
@@ -196,17 +196,17 @@ fn command_handler(
     devices: &mut Vec<Device>,
     _client: Arc<UnsafeCell<UsbIpClient>>,
 ) {
-    println!("Command handler called with command: {:?}", command);
+    debug!("Command handler called with command: {:?}", command);
     let msg_type = IOUSBHostCIMessageType(
         (command.control & IOUSBHostCIMessageControlType) >> IOUSBHostCIMessageControlTypePhase,
     );
-    println!("Command type: {}", unsafe {
+    debug!("Command type: {}", unsafe {
         CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
     });
 
     match msg_type {
         IOUSBHostCIMessageType::ControllerPowerOn => {
-            println!("I HAVE DA POWAH");
+            debug!("Powering on controller...");
             let res = unsafe {
                 controller
                     .as_ref()
@@ -231,7 +231,6 @@ fn command_handler(
             }
         }
         IOUSBHostCIMessageType::ControllerStart => {
-            println!("STARTING ENGINGES!");
             let res = unsafe {
                 controller
                     .as_ref()
@@ -256,7 +255,6 @@ fn command_handler(
             }
         }
         IOUSBHostCIMessageType::ControllerPause => {
-            println!("PAUSING!");
             let res = unsafe {
                 controller
                     .as_ref()
@@ -281,8 +279,6 @@ fn command_handler(
             }
         }
         IOUSBHostCIMessageType::PortPowerOn => {
-            println!("PORT POWAH!");
-
             let res = unsafe {
                 controller
                     .as_ref()
@@ -310,8 +306,6 @@ fn command_handler(
             unsafe { port.setConnected(true) };
         }
         IOUSBHostCIMessageType::PortStatus => {
-            println!("PORT STATUS!");
-
             let res = unsafe {
                 controller
                     .as_ref()
@@ -337,8 +331,6 @@ fn command_handler(
             }
         }
         IOUSBHostCIMessageType::PortReset => {
-            println!("PORT RESET!");
-
             let res = unsafe {
                 controller
                     .as_ref()
@@ -376,7 +368,6 @@ fn command_handler(
             }
         }
         IOUSBHostCIMessageType::DeviceCreate => {
-            println!("DEVICE CREATE!");
             let err: Option<Retained<NSError>> = None;
 
             let dev = IOUSBHostCIDeviceStateMachine::alloc();
@@ -396,19 +387,19 @@ fn command_handler(
                 dev.respondToCommand_status_deviceAddress_error(
                     NonNull::from(&command),
                     IOUSBHostCIMessageStatus::Success,
-                    1,
+                    devices.len() + 1,
                 )
-            }; // TODO: change address
+            };
             if res.is_err() {
                 panic!("Error: {:?}", err);
             }
 
+            debug!("Device created with address: {:02x}", unsafe { dev.deviceAddress() });
+
             devices.push(Device::new(dev));
         }
         IOUSBHostCIMessageType::EndpointCreate => {
-            println!("ENDPOINT CREATE!");
-
-            // TODO: get device address and pick device from it
+            debug!("ENDPOINT CREATE!");
 
             let ep = IOUSBHostCIEndpointStateMachine::alloc();
             let res = unsafe {
@@ -423,26 +414,34 @@ fn command_handler(
             }
             let ep = res.unwrap();
 
-            let dev = devices.last_mut().unwrap();
 
-            println!("================== Endpoint address: {:#02x}", unsafe {
-                ep.endpointAddress()
-            });
 
             let res = unsafe {
                 ep.respondToCommand_status_error(
                     NonNull::from(&command),
                     IOUSBHostCIMessageStatus::Success,
                 )
-            }; // TODO: change address
+            };
             if res.is_err() {
                 panic!("Error: {:?}", res.err().unwrap());
             }
 
+            let device_address = unsafe { ep.deviceAddress() };
+
+            let dev = devices
+                .iter_mut()
+                .find(|dev| {
+                    let address = dev.get_device_address();
+                    address == device_address
+                })
+                .unwrap();
+
+            debug!("Endpoint created for device with address: {:02x}", device_address);
+
             dev.add_endpoint(Endpoint::new(ep));
         }
         IOUSBHostCIMessageType::EndpointSetNextTransfer => {
-            println!("ENDPOINT SET NEXT TRANSFER!");
+            debug!("ENDPOINT SET NEXT TRANSFER!");
 
             let device_adress: u8 = u8::try_from(
                 (command.data0 & IOUSBHostCICommandMessageData0DeviceAddress)
@@ -455,7 +454,7 @@ fn command_handler(
             )
             .unwrap();
 
-            println!(
+            debug!(
                 "Device address: {:02x}, endpoint address: {:02x}",
                 device_adress, endpoint_address
             );
@@ -490,15 +489,15 @@ fn command_handler(
                     NonNull::from(&command),
                     IOUSBHostCIMessageStatus::Success,
                 )
-            }; // TODO: change address
+            };
             if res.is_err() {
                 panic!("Error: {:?}", res.err().unwrap());
             }
         }
         IOUSBHostCIMessageType::EndpointPause => {
-            println!("ENDPOINT PAUSE!");
+            debug!("ENDPOINT PAUSE!");
 
-            let device_adress: u8 = u8::try_from(
+            let device_address: u8 = u8::try_from(
                 (command.data0 & IOUSBHostCICommandMessageData0DeviceAddress)
                     >> IOUSBHostCICommandMessageData0DeviceAddressPhase,
             )
@@ -509,14 +508,16 @@ fn command_handler(
             )
             .unwrap();
 
+            // FIXME: select devices by address as index
             let dev = devices
                 .iter()
                 .find(|dev| {
                     let address = u8::try_from(dev.get_device_address()).unwrap();
-                    address == device_adress
+                    address == device_address
                 })
                 .unwrap();
 
+            // FIXME: select devices by address as index
             let ep = dev
                 .get_endpoints()
                 .iter()
@@ -558,7 +559,7 @@ fn doorbell_handler(
     client: Arc<UnsafeCell<UsbIpClient>>,
     rt: &Runtime,
 ) {
-    println!(
+    debug!(
         "Doorbell handler called with doorbell: {:?}",
         doorbell_array
     );
@@ -578,7 +579,7 @@ fn doorbell_handler(
             u8::try_from((db & IOUSBHostCIDoorbellStreamID) >> IOUSBHostCIDoorbellStreamIDPhase)
                 .unwrap();
 
-        println!(
+        debug!(
             "Doorbell device address: {:02x}, endpoint address: {:02x}, stream id: {:02x}",
             device_adress, endpoint_address, stream_id
         );
@@ -610,22 +611,20 @@ fn doorbell_handler(
         let msg_type = IOUSBHostCIMessageType(
             (msg.control & IOUSBHostCIMessageControlType) >> IOUSBHostCIMessageControlTypePhase,
         );
-        println!("MSG type: {}", unsafe {
+        debug!("MSG type: {}", unsafe {
             CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
         });
         let msg_status = IOUSBHostCIMessageStatus(
             (msg.control & IOUSBHostCIMessageControlStatus) >> IOUSBHostCIMessageControlStatusPhase,
         );
-        println!("MSG status: {}", unsafe {
+        debug!("MSG status: {}", unsafe {
             CStr::from_ptr(msg_status.to_string()).to_str().unwrap()
         });
 
         match msg_type {
             IOUSBHostCIMessageType::SetupTransfer => {
-                println!("Setup Transfer");
-
                 if msg.control & IOUSBHostCIMessageControlNoResponse != 0 {
-                    println!("No response needed...");
+                    debug!("No response needed...");
                     return;
                 }
 
@@ -651,7 +650,7 @@ fn doorbell_handler(
                     .try_into()
                     .unwrap();
 
-                println!("Setup Transfer: requestType: {:02x}, request: {:02x}, value: {:02x}, index: {:02x}, length: {:02x}", request_type, request, value, index, length);
+                debug!("Setup Transfer: requestType: {:02x}, request: {:02x}, value: {:02x}, index: {:02x}, length: {:02x}", request_type, request, value, index, length);
 
                 let mut cl = Arc::clone(&client);
 
@@ -681,7 +680,7 @@ fn doorbell_handler(
                     (msg.control & IOUSBHostCIMessageControlType)
                         >> IOUSBHostCIMessageControlTypePhase,
                 );
-                println!("MSG type: {}", unsafe {
+                debug!("MSG type: {}", unsafe {
                     CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
                 });
 
@@ -703,9 +702,6 @@ fn doorbell_handler(
                         )
                     };
 
-                    // let usbip_dir = if (endpoint_address & 0x80) != 0 { UsbIpDirection::UsbDirOut } else { UsbIpDirection::UsbDirIn };
-                    // let data_dir = if (request_type & 0x80) != 0 { UsbIpDirection::UsbDirIn } else { UsbIpDirection::UsbDirOut };
-
                     let dir = if (request_type & 0x80) != 0 {
                         UsbIpDirection::UsbDirIn
                     } else {
@@ -718,7 +714,7 @@ fn doorbell_handler(
                         UrbTransferFlags::DirOut
                     };
 
-                    println!("Length: {}", data_length);
+                    debug!("Length: {}", data_length);
                     let transfer_buffer = if flags == UrbTransferFlags::DirIn {
                         vec![]
                     } else {
@@ -727,7 +723,7 @@ fn doorbell_handler(
 
                     let ret = rt
                         .block_on(async {
-                            println!("Submitting setup transfer...");
+                            debug!("Submitting setup transfer...");
                             unsafe {
                                 cl.borrow_mut()
                                     .get()
@@ -749,18 +745,18 @@ fn doorbell_handler(
                         })
                         .unwrap();
 
-                    println!("Submit result: {:?}", ret);
+                    debug!("Submit result: {:?}", ret);
 
                     let real_length = min(ret.buffer.len(), data_length as usize);
                     if (real_length as u32) != data_length {
-                        println!(
+                        debug!(
                             "WARN: Data length mismatch: {} != {}",
                             real_length, data_length
                         );
                     }
 
                     if flags == UrbTransferFlags::DirIn {
-                        println!("Copying data to buffer...");
+                        debug!("Copying data to buffer...");
                         buffer[..real_length].copy_from_slice(&ret.buffer[..real_length as usize]);
                     } else {
                     }
@@ -786,7 +782,7 @@ fn doorbell_handler(
                     (msg.control & IOUSBHostCIMessageControlType)
                         >> IOUSBHostCIMessageControlTypePhase,
                 );
-                println!("MSG type: {}", unsafe {
+                debug!("MSG type: {}", unsafe {
                     CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
                 });
 
@@ -815,7 +811,7 @@ fn doorbell_handler(
                         (msg.control & IOUSBHostCIMessageControlType)
                             >> IOUSBHostCIMessageControlTypePhase,
                     );
-                    println!("MSG type: {}", unsafe {
+                    debug!("MSG type: {}", unsafe {
                         CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
                     });
 
@@ -850,8 +846,8 @@ fn doorbell_handler(
                     )
                 };
 
-                println!("Length: {}", data_length);
-                println!("Buffer: {:?}", buffer);
+                debug!("Length: {}", data_length);
+                debug!("Buffer: {:?}", buffer);
 
                 let dir = if (endpoint_address & 0x00000080) != 0 {
                     UsbIpDirection::UsbDirIn
@@ -897,22 +893,22 @@ fn doorbell_handler(
                     }
                     .unwrap();
                     run_on_main(move |_| {
-                        println!("Submit result: {:?}", ret);
+                        debug!("Submit result: {:?}", ret);
 
                         let real_length = min(ret.buffer.len(), data_length as usize);
                         if (real_length as u32) != data_length {
-                            println!(
+                            debug!(
                                 "WARN: Data length mismatch: {} != {}",
                                 real_length, data_length
                             );
                         }
 
                         if dir == UsbIpDirection::UsbDirIn {
-                            println!("Copying data to buffer...");
+                            debug!("Copying data to buffer...");
                             buffer[..real_length]
                                 .copy_from_slice(&ret.buffer[..real_length as usize]);
                         } else {
-                            println!("Copying data from buffer... NOT IMPLEMENTED");
+                            debug!("Copying data from buffer... NOT IMPLEMENTED");
                         }
 
                         let ep_ptr = ep_ptr;
@@ -935,7 +931,7 @@ fn doorbell_handler(
                             (msg.control & IOUSBHostCIMessageControlType)
                                 >> IOUSBHostCIMessageControlTypePhase,
                         );
-                        println!("MSG type: {}", unsafe {
+                        debug!("MSG type: {}", unsafe {
                             CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
                         });
 
@@ -945,11 +941,11 @@ fn doorbell_handler(
 
                         if msg.control & IOUSBHostCIMessageControlValid != 0 {
                             // panic!("Message should be valid");
-                            println!("Message is valid");
+                            debug!("Message is valid");
                             return;
                         }
 
-                        println!(
+                        debug!(
                             "======== Needs response? {}",
                             msg.control & IOUSBHostCIMessageControlNoResponse != 0
                         );
@@ -971,12 +967,12 @@ fn doorbell_handler(
                                 (msg.control & IOUSBHostCIMessageControlType)
                                     >> IOUSBHostCIMessageControlTypePhase,
                             );
-                            println!("MSG type: {}", unsafe {
+                            debug!("MSG type: {}", unsafe {
                                 CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
                             });
 
                             if msg.control & IOUSBHostCIMessageControlValid != 0 {
-                                println!("Message is valid");
+                                debug!("Message is valid");
                                 return;
                             }
                         }
@@ -998,5 +994,5 @@ unsafe extern "C-unwind" fn interest_handler(
     message_type: u32,
     message_argument: *mut c_void,
 ) {
-    println!("Interest handler called with ref_con: {:?}, io_service_t: {}, message_type: {}, message_argument: {:?}", ref_con, io_service_t, message_type, message_argument);
+    debug!("Interest handler called with ref_con: {:?}, io_service_t: {}, message_type: {}, message_argument: {:?}", ref_con, io_service_t, message_type, message_argument);
 }
