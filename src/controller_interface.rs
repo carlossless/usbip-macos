@@ -394,7 +394,9 @@ fn command_handler(
                 panic!("Error: {:?}", err);
             }
 
-            debug!("Device created with address: {:02x}", unsafe { dev.deviceAddress() });
+            debug!("Device created with address: {:02x}", unsafe {
+                dev.deviceAddress()
+            });
 
             devices.push(Device::new(dev));
         }
@@ -413,8 +415,6 @@ fn command_handler(
                 panic!("Error: {:?}", res.err().unwrap());
             }
             let ep = res.unwrap();
-
-
 
             let res = unsafe {
                 ep.respondToCommand_status_error(
@@ -436,7 +436,10 @@ fn command_handler(
                 })
                 .unwrap();
 
-            debug!("Endpoint created for device with address: {:02x}", device_address);
+            debug!(
+                "Endpoint created for device with address: {:02x}",
+                device_address
+            );
 
             dev.add_endpoint(Endpoint::new(ep));
         }
