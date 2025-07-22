@@ -8,6 +8,7 @@ use clap::{arg, Command};
 use clap_num::maybe_hex;
 use controller_interface::{ControllerInterface, ForceableSend};
 use dispatch2::dispatch_main;
+use log::debug;
 use simple_logger::SimpleLogger;
 use tokio;
 use usbip::UsbIpClient;
@@ -134,18 +135,20 @@ fn attach(
     let mut client = UsbIpClient::new();
     rt.block_on(client.connect(&addr)).unwrap();
     let devices = rt.block_on(client.list_devices()).unwrap();
-    let device = devices
-        .iter()
-        .find(|d| {
-            if let Some(busid) = &busid {
-                d.get_busid() == busid.as_bytes()
-            } else if let (Some(vendor_id), Some(product_id)) = (vendor_id, product_id) {
-                d.get_id_vendor() == vendor_id && d.get_id_product() == product_id
-            } else {
-                false
-            }
-        })
-        .unwrap();
+    let device = devices.iter().find(|d| {
+        if let Some(busid) = &busid {
+            d.get_busid() == busid.as_bytes()
+        } else if let (Some(vendor_id), Some(product_id)) = (vendor_id, product_id) {
+            d.get_id_vendor() == vendor_id && d.get_id_product() == product_id
+        } else {
+            false
+        }
+    });
+
+    let Some(device) = device else {
+        eprintln!("Device not found");
+        process::exit(1);
+    };
 
     rt.block_on(client.connect(&addr)).unwrap();
     rt.block_on(client.import_device(*device.get_busid()))
@@ -156,7 +159,7 @@ fn attach(
     let _con_iface = ControllerInterface::new(client)?;
 
     rt.spawn(async move {
-        println!("Controller interface initialized successfully.");
+        debug!("Controller interface initialized successfully.");
         let cl = clien_1;
         loop {
             unsafe {
@@ -171,6 +174,4 @@ fn attach(
     });
 
     dispatch_main();
-
-    // Ok(())
 }

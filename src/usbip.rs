@@ -1,7 +1,7 @@
 use std::{collections::HashMap, ffi::CStr, fmt::Debug, io::Error, sync::Arc};
 
-use bitflags::bitflags;
 use bytes::{Buf, BufMut, BytesMut};
+use log::{debug, error};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -11,25 +11,6 @@ use tokio::{
 const USBIP_VERSION: u16 = 273;
 
 type UsbIpSeqnum = u32;
-
-bitflags! {
-    /// Represents a set of flags.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct UrbTransferFlags: u32 {
-        // Allowed transfer_flags  | value      | control | interrupt | bulk     | isochronous
-        const ShortNotOk       = 0x00000001; // only in | only in   | only in  | no
-        const IsoAsap          = 0x00000002; // no      | no        | no       | yes
-        const NoTransferDmaMap = 0x00000004; // yes     | yes       | yes      | yes
-        const NoFsbr           = 0x00000020; // yes     | no        | no       | no
-        const ZeroPacket       = 0x00000040; // no      | no        | only out | no
-        const NoInterrupt      = 0x00000080; // yes     | yes       | yes      | yes
-        const FreeBuffer       = 0x00000100; // yes     | yes       | yes      | yes
-        const DirMask          = 0x00000200; // yes     | yes       | yes      | yes
-
-        const DirIn            = 0x00000200;
-        const DirOut           = 0x00000000;
-    }
-}
 
 pub struct Interface {
     interface_class: u8,
@@ -345,13 +326,14 @@ impl UsbIpClient {
 
     pub async fn list_devices(&mut self) -> Result<Vec<Device>, Error> {
         if let None = self.stream {
+            // TODO: fix
             return Err(Error::new(
                 std::io::ErrorKind::NotConnected,
                 "Not connected to USBIP server",
             ));
         }
 
-        println!("Sending {:?} Request", UsbIpCommand::ReqDevlist);
+        debug!("Sending {:?} Request", UsbIpCommand::ReqDevlist);
 
         let stream = self.stream.as_mut().unwrap();
 
@@ -367,7 +349,7 @@ impl UsbIpClient {
         stream.read_u32().await?;
         let device_count = stream.read_u32().await?;
 
-        println!(
+        debug!(
             "Received USBIP_DEVLIST response, device count: {}",
             device_count
         );
@@ -435,7 +417,7 @@ impl UsbIpClient {
             ));
         }
 
-        println!("Sending {:?} Request", UsbIpCommand::ReqImport);
+        debug!("Sending {:?} Request", UsbIpCommand::ReqImport);
 
         let stream = self.stream.as_mut().unwrap();
 
@@ -493,7 +475,7 @@ impl UsbIpClient {
             interfaces,
         };
 
-        println!(
+        debug!(
             "Received {:?} response, status: {}, {:?}",
             UsbIpCommand::ReqImport,
             status,
@@ -555,7 +537,7 @@ impl UsbIpClient {
         request.put(&cmd.to_bytes()[..]);
 
         stream.write_all(&request).await?;
-        println!("Sent USBIP_CMD_SUBMIT request {:?}", cmd);
+        debug!("Sent USBIP_CMD_SUBMIT request {:?}", cmd);
 
         let (tx, rx) = oneshot::channel();
 
@@ -581,7 +563,7 @@ impl UsbIpClient {
                     UsbReturnSubmit::from_header_and_stream(direction, header, stream).await?;
                 let _ = tx.send(ret);
             } else {
-                eprintln!("Received response with unknown secnum: {}", secnum);
+                error!("Received response with unknown secnum: {}", secnum);
             }
         }
         Ok(())

@@ -47,7 +47,7 @@ use tokio::runtime::Runtime;
 use crate::{
     device::Device,
     endpoint::Endpoint,
-    usbip::{UrbTransferFlags, UsbIpClient, UsbIpDirection},
+    usbip::{UsbIpClient, UsbIpDirection},
 };
 
 // These constants are not prosent in objc2-io-usb-host, so we define them here https://github.com/madsmtm/objc2/issues/753
@@ -153,10 +153,8 @@ impl ControllerInterface {
         let mut error: Option<Retained<NSError>> = None;
 
         let interface = unsafe {
-            let interface = IOUSBHostControllerInterface::alloc();
-
             let interface = IOUSBHostControllerInterface::initWithCapabilities_queue_interruptRateHz_error_commandHandler_doorbellHandler_interestHandler(
-                interface,
+                IOUSBHostControllerInterface::alloc(),
                 &capabilities,
                 None,
                 1000,
@@ -368,17 +366,14 @@ fn command_handler(
             }
         }
         IOUSBHostCIMessageType::DeviceCreate => {
-            let err: Option<Retained<NSError>> = None;
-
-            let dev = IOUSBHostCIDeviceStateMachine::alloc();
             let res = unsafe {
                 IOUSBHostCIDeviceStateMachine::initWithInterface_command_error(
-                    dev,
+                    IOUSBHostCIDeviceStateMachine::alloc(),
                     controller.as_ref(),
                     NonNull::from(&command),
                 )
             };
-            if res.is_err() {
+            if let Err(err) = res {
                 panic!("Error: {:?}", err);
             }
             let dev = res.unwrap();
@@ -390,7 +385,7 @@ fn command_handler(
                     devices.len() + 1,
                 )
             };
-            if res.is_err() {
+            if let Err(err) = res {
                 panic!("Error: {:?}", err);
             }
 
@@ -403,10 +398,9 @@ fn command_handler(
         IOUSBHostCIMessageType::EndpointCreate => {
             debug!("ENDPOINT CREATE!");
 
-            let ep = IOUSBHostCIEndpointStateMachine::alloc();
             let res = unsafe {
                 IOUSBHostCIEndpointStateMachine::initWithInterface_command_error(
-                    ep,
+                    IOUSBHostCIEndpointStateMachine::alloc(),
                     controller.as_ref(),
                     NonNull::from(&command),
                 )
@@ -710,18 +704,11 @@ fn doorbell_handler(
                     } else {
                         UsbIpDirection::UsbDirOut
                     };
-                    // let dir = if (request_type & 0x80 as u8) != 0 { 1 } else { 0 };
-                    let flags = if (request_type & 0x80 as u8) != 0 {
-                        UrbTransferFlags::DirIn
-                    } else {
-                        UrbTransferFlags::DirOut
-                    };
 
                     debug!("Length: {}", data_length);
-                    let transfer_buffer = if flags == UrbTransferFlags::DirIn {
-                        vec![]
-                    } else {
-                        buffer.to_vec()
+                    let transfer_buffer = match dir {
+                        UsbIpDirection::UsbDirIn => vec![],
+                        UsbIpDirection::UsbDirOut => buffer.to_vec(),
                     };
 
                     let ret = rt
@@ -733,9 +720,9 @@ fn doorbell_handler(
                                     .as_mut()
                                     .unwrap()
                                     .cmd_submit(
-                                        dir as UsbIpDirection,
+                                        dir,
                                         (endpoint_address & 0x0f) as u32,
-                                        flags.bits(),
+                                        0,
                                         length as u32,
                                         0,
                                         0,
@@ -758,7 +745,7 @@ fn doorbell_handler(
                         );
                     }
 
-                    if flags == UrbTransferFlags::DirIn {
+                    if dir == UsbIpDirection::UsbDirIn {
                         debug!("Copying data to buffer...");
                         buffer[..real_length].copy_from_slice(&ret.buffer[..real_length as usize]);
                     } else {
@@ -877,14 +864,9 @@ fn doorbell_handler(
                             .as_mut()
                             .unwrap()
                             .cmd_submit(
-                                dir as UsbIpDirection,
+                                dir,
                                 (endpoint_address & 0x0f) as u32,
-                                (if dir == UsbIpDirection::UsbDirIn {
-                                    UrbTransferFlags::DirIn
-                                } else {
-                                    UrbTransferFlags::DirOut
-                                })
-                                .bits(),
+                                0,
                                 data_length as u32,
                                 0,
                                 0,
@@ -948,10 +930,6 @@ fn doorbell_handler(
                             return;
                         }
 
-                        debug!(
-                            "======== Needs response? {}",
-                            msg.control & IOUSBHostCIMessageControlNoResponse != 0
-                        );
                         if msg.control & IOUSBHostCIMessageControlNoResponse == 0 {
                             let res = unsafe {
                                 ep.enqueueTransferCompletionForMessage_status_transferLength_error(
