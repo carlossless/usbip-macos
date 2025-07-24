@@ -8,7 +8,7 @@ use tokio::{
     sync::{oneshot, Mutex},
 };
 
-const USBIP_VERSION: u16 = 273;
+const USBIP_VERSION: u16 = 0x0111; // 1.1.1
 
 type UsbIpSeqnum = u32;
 
@@ -39,6 +39,10 @@ pub struct Device {
 impl Device {
     pub fn get_busid(&self) -> &[u8; 32] {
         &self.busid
+    }
+
+    pub fn get_devnum(&self) -> u32 {
+        self.devnum
     }
 
     pub fn get_id_vendor(&self) -> u16 {
@@ -554,18 +558,23 @@ impl UsbIpClient {
     }
 
     pub async fn poll(&mut self) -> Result<(), Error> {
-        if let Some(stream) = &mut self.stream {
-            stream.readable().await?;
-            let header = UsbCommandHeader::from_stream(stream).await?;
-            let secnum = header.seqnum;
-            if let Some((direction, tx)) = self.pending.lock().await.remove(&secnum) {
-                let ret =
-                    UsbReturnSubmit::from_header_and_stream(direction, header, stream).await?;
-                let _ = tx.send(ret);
-            } else {
-                error!("Received response with unknown secnum: {}", secnum);
-            }
+        let Some(stream) = &mut self.stream else {
+            return Err(Error::new(
+                std::io::ErrorKind::NotConnected,
+                "Not connected to USBIP server",
+            ));
+        };
+
+        stream.readable().await?;
+
+        let header = UsbCommandHeader::from_stream(stream).await?;
+        let secnum = header.seqnum;
+        if let Some((direction, tx)) = self.pending.lock().await.remove(&secnum) {
+            let ret = UsbReturnSubmit::from_header_and_stream(direction, header, stream).await?;
+            let _ = tx.send(ret);
+        } else {
+            error!("Received response with unknown secnum: {}", secnum);
         }
-        Ok(())
+        return Ok(());
     }
 }

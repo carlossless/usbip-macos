@@ -41,17 +41,26 @@ fn main() {
         .subcommand(
             Command::new("attach")
                 .arg(
-                    arg!(-b --busid <BUSID>)
+                    arg!(--busid <BUSID>)
                         .value_parser(clap::value_parser!(String))
                         .required_unless_present_all(&["vendor_id", "product_id"])
-                        .conflicts_with_all(&["vendor_id", "product_id"])
+                        .conflicts_with_all(&["vendor_id", "product_id", "device"])
                         .help("The device to attach (busid)"),
+                )
+                .arg(
+                    arg!(--device <DEVICE>)
+                        .value_parser(clap::value_parser!(u32))
+                        .required_unless_present_all(&["vendor_id", "product_id"])
+                        .conflicts_with_all(&["vendor_id", "product_id", "busid"])
+                        .conflicts_with("busid")
+                        .help("id of the virtual UDC"),
                 )
                 .arg(
                     arg!(--vendor_id <VENDOR_ID>)
                         .value_parser(maybe_hex::<u16>)
                         .required_unless_present("busid")
                         .conflicts_with("busid")
+                        .conflicts_with("device")
                         .help("The vendor ID of the device to attach"),
                 )
                 .arg(
@@ -59,36 +68,38 @@ fn main() {
                         .value_parser(maybe_hex::<u16>)
                         .required_unless_present("busid")
                         .conflicts_with("busid")
+                        .conflicts_with("device")
                         .help("The product ID of the device to attach"),
                 ),
         )
         .subcommand(Command::new("list"))
         .arg(
-            arg!(--host <HOST>)
+            arg!(-r --remote <HOST>)
                 .value_parser(clap::value_parser!(String))
                 .required(true)
                 .help("The host to connect to"),
         )
         .arg(
-            arg!(-p --port <PORT>)
+            arg!(-p --"tcp-port" <PORT>)
                 .value_parser(clap::value_parser!(u16))
                 .default_value("3240")
                 .help("The port to connect to"),
         )
         .get_matches();
 
-    let host = matches.get_one::<String>("host").unwrap();
-    let port = matches.get_one::<u16>("port").unwrap();
+    let host = matches.get_one::<String>("remote").unwrap();
+    let port = matches.get_one::<u16>("tcp-port").unwrap();
 
     let addr = format!("{host}:{port}");
 
     match matches.subcommand() {
         Some(("attach", submatches)) => {
             let busid = submatches.get_one::<String>("busid").cloned();
+            let device = submatches.get_one::<u32>("device").cloned();
             let vendor_id = submatches.get_one::<u16>("vendor_id").cloned();
             let product_id = submatches.get_one::<u16>("product_id").cloned();
 
-            attach(&addr, busid, vendor_id, product_id).unwrap_or_else(|e| {
+            attach(&addr, busid, device, vendor_id, product_id).unwrap_or_else(|e| {
                 eprintln!("Error attach device: {}", e);
                 process::exit(1);
             });
@@ -124,6 +135,7 @@ fn list(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 fn attach(
     addr: &str,
     busid: Option<String>,
+    device: Option<u32>,
     vendor_id: Option<u16>,
     product_id: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -138,6 +150,8 @@ fn attach(
     let device = devices.iter().find(|d| {
         if let Some(busid) = &busid {
             d.get_busid() == busid.as_bytes()
+        } else if let Some(device) = &device {
+            d.get_devnum() == *device
         } else if let (Some(vendor_id), Some(product_id)) = (vendor_id, product_id) {
             d.get_id_vendor() == vendor_id && d.get_id_product() == product_id
         } else {
@@ -153,14 +167,14 @@ fn attach(
     rt.block_on(client.connect(&addr)).unwrap();
     rt.block_on(client.import_device(*device.get_busid()))
         .unwrap();
-    let client = Arc::new(UnsafeCell::new(client));
-    let clien_1 = ForceableSend(Arc::clone(&client));
+    let ci_client = Arc::new(UnsafeCell::new(client));
+    let usbip_client = ForceableSend(Arc::clone(&ci_client));
 
-    let _con_iface = ControllerInterface::new(client)?;
+    let _con_iface = ControllerInterface::new(ci_client)?;
 
     rt.spawn(async move {
         debug!("Controller interface initialized successfully.");
-        let cl = clien_1;
+        let cl = usbip_client;
         loop {
             unsafe {
                 // Get mutable reference to UsbIpClient and call poll if it exists
