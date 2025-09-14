@@ -3,6 +3,7 @@ use objc2_io_usb_host::IOUSBHostCIDeviceStateMachine;
 
 use crate::endpoint::Endpoint;
 
+#[derive(Debug)]
 pub struct Device {
     state_machine: Retained<IOUSBHostCIDeviceStateMachine>,
     endpoints: Vec<Endpoint>,
@@ -10,7 +11,7 @@ pub struct Device {
 
 impl Device {
     pub fn new(state_machine: Retained<IOUSBHostCIDeviceStateMachine>) -> Self {
-        Device {
+        Self {
             state_machine,
             endpoints: Vec::new(),
         }
@@ -20,11 +21,11 @@ impl Device {
         self.endpoints.push(endpoint);
     }
 
-    pub fn get_device_address(&self) -> usize {
+    pub fn device_address(&self) -> usize {
         unsafe { self.state_machine.deviceAddress() }
     }
 
-    pub fn get_endpoints(&self) -> &Vec<Endpoint> {
+    pub fn endpoints(&self) -> &[Endpoint] {
         &self.endpoints
     }
 }

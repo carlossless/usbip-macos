@@ -50,39 +50,51 @@ use crate::{
     usbip::{UsbIpClient, UsbIpDirection},
 };
 
-// These constants are not prosent in objc2-io-usb-host, so we define them here https://github.com/madsmtm/objc2/issues/753
+// These constants are not present in objc2-io-usb-host, so we define them here
+// https://github.com/madsmtm/objc2/issues/753
 macro_rules! IOUSBBitRange {
     ($start:expr, $end:expr) => {
         !((1 << $start) - 1) & ((1 << $end) | ((1 << $end) - 1))
     };
 }
+
 #[allow(non_upper_case_globals)]
 pub const IOUSBHostCISetupTransferData1wIndex: c_ulong = IOUSBBitRange!(32, 47);
 #[allow(non_upper_case_globals)]
 pub const IOUSBHostCISetupTransferData1wLength: c_ulong = IOUSBBitRange!(48, 63);
 
+const CONTROLLER_TIMEOUT_THRESHOLD: u32 = 1; // 2 seconds
+const CONTROLLER_CONNECTION_LATENCY: u32 = 2; // 4ms
+const PORT_COUNT: u32 = 1;
+const MAX_POWER_MA: u32 = 907; // mA
+const POWER_UNIT_SIZE: u32 = 8; // 8mA units
+
+/// A wrapper to force Send trait on types that may not be Send
+/// This is used for cross-thread communication with Objective-C objects
 pub struct ForceableSend<T>(pub T);
 
 unsafe impl<T> Send for ForceableSend<T> {}
+unsafe impl<T> Sync for ForceableSend<T> {}
 
+#[derive(Debug)]
 pub struct ControllerInterface {
     control_interface: Retained<IOUSBHostControllerInterface>,
     devices: Rc<RefCell<Vec<Device>>>,
     rt: Rc<RefCell<Runtime>>,
 }
 
+/// Convert FnMut to Fn for use with Objective-C blocks
 fn fnmut_to_fn2<T, U>(closure: impl FnMut(T, U)) -> impl Fn(T, U) {
     let cell = RefCell::new(closure);
-
     move |a, b| {
         let mut closure = cell.try_borrow_mut().expect("re-entrant call");
         (closure)(a, b)
     }
 }
 
+/// Convert FnMut to Fn for use with Objective-C blocks
 fn fnmut_to_fn3<T, U, V>(closure: impl FnMut(T, U, V)) -> impl Fn(T, U, V) {
     let cell = RefCell::new(closure);
-
     move |a, b, c| {
         let mut closure = cell.try_borrow_mut().expect("re-entrant call");
         (closure)(a, b, c)
@@ -91,99 +103,151 @@ fn fnmut_to_fn3<T, U, V>(closure: impl FnMut(T, U, V)) -> impl Fn(T, U, V) {
 
 impl ControllerInterface {
     pub fn new(usbip_client: Arc<UnsafeCell<UsbIpClient>>) -> Result<Self, Error> {
-        let mut capabilities: IOUSBHostCIMessage = IOUSBHostCIMessage {
+        let mut capabilities = Self::create_controller_capabilities();
+        let mut port_capabilities = Self::create_port_capabilities();
+
+        let rt = Self::create_runtime()?;
+        let devices = Rc::new(RefCell::new(Vec::new()));
+
+        let (devices_cmd, devices_db) = (Rc::clone(&devices), Rc::clone(&devices));
+        let (usbip_client_cmd, usbip_client_db) =
+            (Arc::clone(&usbip_client), Arc::clone(&usbip_client));
+        let rt = Rc::new(RefCell::new(rt));
+        let rt_db = Rc::clone(&rt);
+
+        let command_block = Self::create_command_block(devices_cmd, usbip_client_cmd);
+        let doorbell_block = Self::create_doorbell_block(devices_db, usbip_client_db, rt_db);
+
+        let capabilities_data =
+            Self::create_capabilities_data(&mut capabilities, &mut port_capabilities)?;
+
+        let interface =
+            Self::create_controller_interface(&capabilities_data, &command_block, &doorbell_block)?;
+
+        Ok(Self {
+            control_interface: interface,
+            devices,
+            rt,
+        })
+    }
+
+    fn create_controller_capabilities() -> IOUSBHostCIMessage {
+        IOUSBHostCIMessage {
             control: (IOUSBHostCIMessageType::ControllerCapabilities.0
                 << IOUSBHostCIMessageControlTypePhase)
                 | IOUSBHostCIMessageControlNoResponse
                 | IOUSBHostCIMessageControlValid
-                | (1 << IOUSBHostCICapabilitiesMessageControlPortCountPhase), // Port count
-            data0: (1 << IOUSBHostCICapabilitiesMessageData0CommandTimeoutThresholdPhase) // 2 seconds
-                | (2 << IOUSBHostCICapabilitiesMessageData0ConnectionLatencyPhase), // 4ms
+                | (PORT_COUNT << IOUSBHostCICapabilitiesMessageControlPortCountPhase),
+            data0: (CONTROLLER_TIMEOUT_THRESHOLD
+                << IOUSBHostCICapabilitiesMessageData0CommandTimeoutThresholdPhase)
+                | (CONTROLLER_CONNECTION_LATENCY
+                    << IOUSBHostCICapabilitiesMessageData0ConnectionLatencyPhase),
             data1: 0,
-        };
+        }
+    }
 
-        let mut port_capabilities: IOUSBHostCIMessage = IOUSBHostCIMessage {
+    fn create_port_capabilities() -> IOUSBHostCIMessage {
+        IOUSBHostCIMessage {
             control: (IOUSBHostCIMessageType::PortCapabilities.0
                 << IOUSBHostCIMessageControlTypePhase)
                 | IOUSBHostCIMessageControlNoResponse
                 | IOUSBHostCIMessageControlValid
                 | (1 << IOUSBHostCIPortCapabilitiesMessageControlPortNumberPhase)
                 | (0 << IOUSBHostCIPortCapabilitiesMessageControlConnectorTypePhase), // ACPI TypeA
-            data0: ((907 / 8) << IOUSBHostCIPortCapabilitiesMessageData0MaxPowerPhase), // Max power for the power (8mA units)
+            data0: ((MAX_POWER_MA / POWER_UNIT_SIZE)
+                << IOUSBHostCIPortCapabilitiesMessageData0MaxPowerPhase),
             data1: 0,
-        };
+        }
+    }
 
-        let rt = tokio::runtime::Builder::new_multi_thread()
+    fn create_runtime() -> Result<tokio::runtime::Runtime, Error> {
+        tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .unwrap();
+            .map_err(|e| {
+                Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to create runtime: {}", e),
+                )
+            })
+    }
 
-        let devices: Rc<RefCell<Vec<Device>>> = Rc::new(RefCell::new(Vec::new()));
-        let devices_cmd = Rc::clone(&devices);
-        let devices_db = Rc::clone(&devices);
+    fn create_command_block(
+        devices: Rc<RefCell<Vec<Device>>>,
+        usbip_client: Arc<UnsafeCell<UsbIpClient>>,
+    ) -> RcBlock<dyn Fn(NonNull<IOUSBHostControllerInterface>, IOUSBHostCIMessage)> {
+        RcBlock::new(fnmut_to_fn2(move |a, b| {
+            let dev: &mut Vec<Device> = unsafe { &mut *devices.as_ptr() };
+            command_handler(a, b, dev, Arc::clone(&usbip_client))
+        }))
+    }
 
-        let usbip_client_cmd = Arc::clone(&usbip_client);
-        let usbip_client_db = Arc::clone(&usbip_client);
+    fn create_doorbell_block(
+        devices: Rc<RefCell<Vec<Device>>>,
+        usbip_client: Arc<UnsafeCell<UsbIpClient>>,
+        rt: Rc<RefCell<Runtime>>,
+    ) -> RcBlock<dyn Fn(NonNull<IOUSBHostControllerInterface>, NonNull<IOUSBHostCIDoorbell>, u32)>
+    {
+        RcBlock::new(fnmut_to_fn3(move |a, b, c| {
+            let dev: &mut Vec<Device> = unsafe { &mut *devices.as_ptr() };
+            doorbell_handler(a, b, c, dev, Arc::clone(&usbip_client), &rt.borrow())
+        }))
+    }
 
-        let rt = Rc::new(RefCell::new(rt));
-        let rt_db = Rc::clone(&rt);
+    fn create_capabilities_data(
+        capabilities: &mut IOUSBHostCIMessage,
+        port_capabilities: &mut IOUSBHostCIMessage,
+    ) -> Result<Retained<NSMutableData>, Error> {
+        unsafe {
+            let data = NSMutableData::dataWithLength(0).ok_or_else(|| {
+                Error::new(std::io::ErrorKind::Other, "Failed to create NSMutableData")
+            })?;
 
-        let command_block = RcBlock::new(fnmut_to_fn2(move |a, b| {
-            let dev: &mut Vec<Device> = unsafe { &mut *devices_cmd.as_ptr() };
-            command_handler(a, b, dev, Arc::clone(&usbip_client_cmd))
-        }));
-        let doorbell_block = RcBlock::new(fnmut_to_fn3(move |a, b, c| {
-            let dev: &mut Vec<Device> = unsafe { &mut *devices_db.as_ptr() };
-            doorbell_handler(a, b, c, dev, Arc::clone(&usbip_client_db), &rt_db.borrow())
-        }));
-
-        let capabilities = unsafe {
-            let data = NSMutableData::dataWithLength(0).unwrap();
             data.appendBytes_length(
-                NonNull::new_unchecked(&mut capabilities as *mut _ as *mut c_void),
+                NonNull::new_unchecked(capabilities as *mut _ as *mut c_void),
                 mem::size_of::<IOUSBHostCIMessage>(),
             );
             data.appendBytes_length(
-                NonNull::new_unchecked(&mut port_capabilities as *mut _ as *mut c_void),
+                NonNull::new_unchecked(port_capabilities as *mut _ as *mut c_void),
                 mem::size_of::<IOUSBHostCIMessage>(),
             );
-            data
-        };
+            Ok(data)
+        }
+    }
 
+    fn create_controller_interface(
+        capabilities: &Retained<NSMutableData>,
+        command_block: &RcBlock<dyn Fn(NonNull<IOUSBHostControllerInterface>, IOUSBHostCIMessage)>,
+        doorbell_block: &RcBlock<
+            dyn Fn(NonNull<IOUSBHostControllerInterface>, NonNull<IOUSBHostCIDoorbell>, u32),
+        >,
+    ) -> Result<Retained<IOUSBHostControllerInterface>, Error> {
         let mut error: Option<Retained<NSError>> = None;
 
         let interface = unsafe {
-            let interface = IOUSBHostControllerInterface::initWithCapabilities_queue_interruptRateHz_error_commandHandler_doorbellHandler_interestHandler(
+            IOUSBHostControllerInterface::initWithCapabilities_queue_interruptRateHz_error_commandHandler_doorbellHandler_interestHandler(
                 IOUSBHostControllerInterface::alloc(),
-                &capabilities,
+                capabilities,
                 None,
                 1000,
                 Some(&mut error),
-                block2::RcBlock::as_ptr(&command_block),
-                block2::RcBlock::as_ptr(&doorbell_block),
+                block2::RcBlock::as_ptr(command_block),
+                block2::RcBlock::as_ptr(doorbell_block),
                 Some(interest_handler)
-            );
-            interface
+            )
         };
 
-        if interface.is_none() {
-            unsafe {
-                error!("Failed to create IOUSBHostControllerInterface");
-                error!(
-                    "Error: {:?}",
-                    error.as_ref().unwrap().localizedFailureReason().unwrap()
-                );
-                return Err(Error::new(
-                    std::io::ErrorKind::Other,
-                    "Failed to create IOUSBHostControllerInterface",
-                ));
+        interface.ok_or_else(|| {
+            if let Some(err) = error {
+                let reason = unsafe { err.localizedFailureReason() }
+                    .map(|r| format!(": {}", r.to_string()))
+                    .unwrap_or_default();
+                error!("Failed to create IOUSBHostControllerInterface{}", reason);
             }
-        }
-
-        Ok(Self {
-            control_interface: interface.unwrap(),
-            devices: devices,
-            rt,
+            Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to create IOUSBHostControllerInterface",
+            )
         })
     }
 }
@@ -425,7 +489,7 @@ fn command_handler(
             let dev = devices
                 .iter_mut()
                 .find(|dev| {
-                    let address = dev.get_device_address();
+                    let address = dev.device_address();
                     address == device_address
                 })
                 .unwrap();
@@ -459,22 +523,22 @@ fn command_handler(
             let dev = devices
                 .iter()
                 .find(|dev| {
-                    let address = u8::try_from(dev.get_device_address()).unwrap();
+                    let address = u8::try_from(dev.device_address()).unwrap();
                     address == device_adress
                 })
                 .unwrap();
 
             let ep = dev
-                .get_endpoints()
+                .endpoints()
                 .iter()
                 .find(|ep| {
-                    let address = u8::try_from(ep.get_endpoint_address()).unwrap();
+                    let address = u8::try_from(ep.endpoint_address()).unwrap();
                     address == endpoint_address
                 })
                 .unwrap();
 
             let res = unsafe {
-                ep.get_state_machine()
+                ep.clone_state_machine()
                     .inspectCommand_error(NonNull::from(&command))
             };
             if res.is_err() {
@@ -482,7 +546,7 @@ fn command_handler(
             }
 
             let res = unsafe {
-                ep.get_state_machine().respondToCommand_status_error(
+                ep.clone_state_machine().respondToCommand_status_error(
                     NonNull::from(&command),
                     IOUSBHostCIMessageStatus::Success,
                 )
@@ -509,23 +573,23 @@ fn command_handler(
             let dev = devices
                 .iter()
                 .find(|dev| {
-                    let address = u8::try_from(dev.get_device_address()).unwrap();
+                    let address = u8::try_from(dev.device_address()).unwrap();
                     address == device_address
                 })
                 .unwrap();
 
             // FIXME: select devices by address as index
             let ep = dev
-                .get_endpoints()
+                .endpoints()
                 .iter()
                 .find(|ep| {
-                    let address = u8::try_from(ep.get_endpoint_address()).unwrap();
+                    let address = u8::try_from(ep.endpoint_address()).unwrap();
                     address == endpoint_address
                 })
                 .unwrap();
 
             let res = unsafe {
-                ep.get_state_machine()
+                ep.clone_state_machine()
                     .inspectCommand_error(NonNull::from(&command))
             };
             if res.is_err() {
@@ -533,7 +597,7 @@ fn command_handler(
             }
 
             let res = unsafe {
-                ep.get_state_machine().respondToCommand_status_error(
+                ep.clone_state_machine().respondToCommand_status_error(
                     NonNull::from(&command),
                     IOUSBHostCIMessageStatus::Success,
                 )
@@ -584,26 +648,26 @@ fn doorbell_handler(
         let dev = devices
             .iter()
             .find(|dev| {
-                let address = u8::try_from(dev.get_device_address()).unwrap();
+                let address = u8::try_from(dev.device_address()).unwrap();
                 address == device_adress
             })
             .unwrap();
 
         let ep = dev
-            .get_endpoints()
+            .endpoints()
             .iter()
             .find(|ep| {
-                let address = u8::try_from(ep.get_endpoint_address()).unwrap();
+                let address = u8::try_from(ep.endpoint_address()).unwrap();
                 address == endpoint_address
             })
             .unwrap();
 
-        let res = unsafe { ep.get_state_machine().processDoorbell_error(*db) };
+        let res = unsafe { ep.clone_state_machine().processDoorbell_error(*db) };
         if res.is_err() {
             panic!("Error: {:?}", res.err().unwrap());
         }
 
-        let msg = unsafe { ep.get_state_machine().currentTransferMessage() };
+        let msg = unsafe { ep.clone_state_machine().currentTransferMessage() };
         let msg = unsafe { msg.as_ref() };
         let msg_type = IOUSBHostCIMessageType(
             (msg.control & IOUSBHostCIMessageControlType) >> IOUSBHostCIMessageControlTypePhase,
@@ -651,7 +715,7 @@ fn doorbell_handler(
 
                 let mut cl = Arc::clone(&client);
 
-                let ep = &ep.get_state_machine();
+                let ep = &ep.clone_state_machine();
 
                 let res = unsafe {
                     ep.enqueueTransferCompletionForMessage_status_transferLength_error(
@@ -845,7 +909,7 @@ fn doorbell_handler(
                     UsbIpDirection::UsbDirOut
                 };
 
-                let ep = &ep.get_state_machine();
+                let ep = &ep.clone_state_machine();
                 let ep_ptr = ForceableSend(ep.clone());
                 let client = ForceableSend(client.clone());
 

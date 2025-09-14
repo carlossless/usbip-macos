@@ -9,10 +9,11 @@ block2 = { git = "https://github.com/madsmtm/objc2.git", branch = "master" }
 dispatch2 = { git = "https://github.com/madsmtm/objc2.git", branch = "master" }
 objc2-foundation = { git = "https://github.com/madsmtm/objc2.git", branch = "master" }
 objc2-io-usb-host = { git = "https://github.com/madsmtm/objc2.git", branch = "master" }
-bytes = "1.10.1"
+bytes = "1"
 tokio = { version = "1", features = ["full"] }
-clap = "4.5.40"
-clap-num = "1.2.0"
+clap = "4"
+clap-num = "1"
+anyhow = { version = "1", features = ["backtrace"] }
 
 [dependencies.log]
 version = "0.4"

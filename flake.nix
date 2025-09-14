@@ -4,9 +4,10 @@
     utils.url = "github:numtide/flake-utils";
     crane.url = "github:ipetkov/crane";
     rust-overlay.url = "github:oxalica/rust-overlay";
+    fenix.url = "github:nix-community/fenix/monthly";
   };
 
-  outputs = { self, nixpkgs, utils, crane, rust-overlay }:
+  outputs = { self, nixpkgs, utils, crane, rust-overlay, fenix }:
     utils.lib.eachDefaultSystem (
       system:
       let
@@ -16,10 +17,11 @@
           inherit system overlays;
         };
 
-        craneLib = (crane.mkLib pkgs).overrideToolchain (p: p.rust-bin.stable.latest.default);
+        craneLib = (crane.mkLib pkgs).overrideToolchain (fenix.packages.${system}.fromToolchainFile {
+          file = ./rust-toolchain.toml;
+          sha256 = "sha256-+9FmLhAOezBZCOziO0Qct1NOrfpjNsXxc/8I0c7BdKE=";
+        });
 
-        # Common arguments can be set here to avoid repeating them later
-        # Note: changes here will rebuild all dependency crates
         commonArgs = {
           src = craneLib.cleanCargoSource ./.;
           strictDeps = true;
