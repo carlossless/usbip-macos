@@ -1,6 +1,4 @@
-use std::{
-    collections::HashMap, ffi::CStr, fmt::Debug, io::Error, sync::Arc,
-};
+use std::{collections::HashMap, ffi::CStr, fmt::Debug, io::Error, sync::Arc};
 
 use anyhow::anyhow;
 use bytes::{Buf, BufMut, BytesMut};
