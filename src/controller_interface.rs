@@ -14,7 +14,7 @@ use std::{
 
 use block2::RcBlock;
 use dispatch2::run_on_main;
-use log::{debug, error};
+use log::{debug, error, warn};
 use objc2::{rc::Retained, AnyThread};
 use objc2_foundation::{NSError, NSMutableData};
 use objc2_io_usb_host::{
@@ -1010,8 +1010,47 @@ fn doorbell_handler(
                     });
                 });
             }
+            IOUSBHostCIMessageType::Link => {
+                warn!("Link message received"); // not usually expected here
+                if msg.control & IOUSBHostCIMessageControlValid != 0 {
+                    // panic!("Message should be valid");
+                    debug!("Message is valid");
+                    return;
+                }
+
+                if msg.control & IOUSBHostCIMessageControlNoResponse == 0 {
+                    debug!("Needs response");
+                    let ep = &ep.clone_state_machine();
+
+                    let res = unsafe {
+                        ep.enqueueTransferCompletionForMessage_status_transferLength_error(
+                            NonNull::from(msg),
+                            IOUSBHostCIMessageStatus::Success,
+                            0,
+                        )
+                    };
+                    if res.is_err() {
+                        panic!("Error: {:?}", res.err().unwrap());
+                    }
+
+                    let msg = unsafe { ep.currentTransferMessage().as_ref() };
+
+                    let msg_type = IOUSBHostCIMessageType(
+                        (msg.control & IOUSBHostCIMessageControlType)
+                            >> IOUSBHostCIMessageControlTypePhase,
+                    );
+                    debug!("MSG type: {}", unsafe {
+                        CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
+                    });
+
+                    if msg.control & IOUSBHostCIMessageControlValid != 0 {
+                        debug!("Message is valid");
+                        return;
+                    }
+                }
+            }
             _ => {
-                panic!("Unknown message type {}", unsafe {
+                panic!("Unexpected message type {}", unsafe {
                     CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
                 });
             }
