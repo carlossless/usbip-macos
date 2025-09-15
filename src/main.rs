@@ -62,15 +62,15 @@ fn build_attach_command() -> Command {
         .arg(
             arg!(--busid <BUSID>)
                 .value_parser(clap::value_parser!(String))
-                .required_unless_present_all(&["vendor_id", "product_id"])
-                .conflicts_with_all(&["vendor_id", "product_id", "device"])
+                .required_unless_present_all(["vendor_id", "product_id"])
+                .conflicts_with_all(["vendor_id", "product_id", "device"])
                 .help("The device to attach (busid)"),
         )
         .arg(
             arg!(--device <DEVICE>)
                 .value_parser(clap::value_parser!(u32))
-                .required_unless_present_all(&["vendor_id", "product_id"])
-                .conflicts_with_all(&["vendor_id", "product_id", "busid"])
+                .required_unless_present_all(["vendor_id", "product_id"])
+                .conflicts_with_all(["vendor_id", "product_id", "busid"])
                 .conflicts_with("busid")
                 .help("id of the virtual UDC"),
         )

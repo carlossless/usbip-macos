@@ -76,11 +76,13 @@ pub struct ForceableSend<T>(pub T);
 unsafe impl<T> Send for ForceableSend<T> {}
 unsafe impl<T> Sync for ForceableSend<T> {}
 
+type CommandHandlerArgs = dyn Fn(NonNull<IOUSBHostControllerInterface>, NonNull<IOUSBHostCIDoorbell>, u32);
+
 #[derive(Debug)]
 pub struct ControllerInterface {
-    control_interface: Retained<IOUSBHostControllerInterface>,
-    devices: Rc<RefCell<Vec<Device>>>,
-    rt: Rc<RefCell<Runtime>>,
+    _control_interface: Retained<IOUSBHostControllerInterface>,
+    _devices: Rc<RefCell<Vec<Device>>>,
+    _rt: Rc<RefCell<Runtime>>,
 }
 
 /// Convert FnMut to Fn for use with Objective-C blocks
@@ -125,9 +127,9 @@ impl ControllerInterface {
             Self::create_controller_interface(&capabilities_data, &command_block, &doorbell_block)?;
 
         Ok(Self {
-            control_interface: interface,
-            devices,
-            rt,
+            _control_interface: interface,
+            _devices: devices,
+            _rt: rt,
         })
     }
 
@@ -165,10 +167,7 @@ impl ControllerInterface {
             .enable_all()
             .build()
             .map_err(|e| {
-                Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to create runtime: {}", e),
-                )
+                Error::other(format!("Failed to create runtime: {}", e))
             })
     }
 
@@ -186,7 +185,7 @@ impl ControllerInterface {
         devices: Rc<RefCell<Vec<Device>>>,
         usbip_client: Arc<UnsafeCell<UsbIpClient>>,
         rt: Rc<RefCell<Runtime>>,
-    ) -> RcBlock<dyn Fn(NonNull<IOUSBHostControllerInterface>, NonNull<IOUSBHostCIDoorbell>, u32)>
+    ) -> RcBlock<CommandHandlerArgs>
     {
         RcBlock::new(fnmut_to_fn3(move |a, b, c| {
             let dev: &mut Vec<Device> = unsafe { &mut *devices.as_ptr() };
@@ -200,7 +199,7 @@ impl ControllerInterface {
     ) -> Result<Retained<NSMutableData>, Error> {
         unsafe {
             let data = NSMutableData::dataWithLength(0).ok_or_else(|| {
-                Error::new(std::io::ErrorKind::Other, "Failed to create NSMutableData")
+                Error::other("Failed to create NSMutableData")
             })?;
 
             data.appendBytes_length(
@@ -218,9 +217,7 @@ impl ControllerInterface {
     fn create_controller_interface(
         capabilities: &Retained<NSMutableData>,
         command_block: &RcBlock<dyn Fn(NonNull<IOUSBHostControllerInterface>, IOUSBHostCIMessage)>,
-        doorbell_block: &RcBlock<
-            dyn Fn(NonNull<IOUSBHostControllerInterface>, NonNull<IOUSBHostCIDoorbell>, u32),
-        >,
+        doorbell_block: &RcBlock<CommandHandlerArgs>,
     ) -> Result<Retained<IOUSBHostControllerInterface>, Error> {
         let mut error: Option<Retained<NSError>> = None;
 
@@ -240,14 +237,11 @@ impl ControllerInterface {
         interface.ok_or_else(|| {
             if let Some(err) = error {
                 let reason = unsafe { err.localizedFailureReason() }
-                    .map(|r| format!(": {}", r.to_string()))
+                    .map(|r| format!(": {}", r))
                     .unwrap_or_default();
                 error!("Failed to create IOUSBHostControllerInterface{}", reason);
             }
-            Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to create IOUSBHostControllerInterface",
-            )
+            Error::other("Failed to create IOUSBHostControllerInterface")
         })
     }
 }
@@ -616,7 +610,7 @@ fn doorbell_handler(
     _controller: NonNull<IOUSBHostControllerInterface>,
     doorbell_array: NonNull<IOUSBHostCIDoorbell>,
     doorbell_count: u32,
-    devices: &mut Vec<Device>,
+    devices: &mut [Device],
     client: Arc<UnsafeCell<UsbIpClient>>,
     rt: &Runtime,
 ) {
@@ -750,10 +744,8 @@ fn doorbell_handler(
                         panic!("Message should need a response");
                     }
 
-                    let data_length: u32 = ((msg.data0 & IOUSBHostCINormalTransferData0Length)
-                        >> IOUSBHostCINormalTransferData0LengthPhase)
-                        .try_into()
-                        .unwrap();
+                    let data_length: u32 = (msg.data0 & IOUSBHostCINormalTransferData0Length)
+                        >> IOUSBHostCINormalTransferData0LengthPhase;
                     let buffer: &mut [u8] = unsafe {
                         from_raw_parts_mut(
                             ((msg.data1 & IOUSBHostCINormalTransferData1Buffer)
@@ -812,7 +804,6 @@ fn doorbell_handler(
                     if dir == UsbIpDirection::UsbDirIn {
                         debug!("Copying data to buffer...");
                         buffer[..real_length].copy_from_slice(&ret.buffer[..real_length as usize]);
-                    } else {
                     }
 
                     let res = unsafe {
@@ -887,10 +878,8 @@ fn doorbell_handler(
                     panic!("Message should be valid");
                 }
 
-                let data_length: u32 = ((msg.data0 & IOUSBHostCINormalTransferData0Length)
-                    >> IOUSBHostCINormalTransferData0LengthPhase)
-                    .try_into()
-                    .unwrap();
+                let data_length: u32 = (msg.data0 & IOUSBHostCINormalTransferData0Length)
+                    >> IOUSBHostCINormalTransferData0LengthPhase;
                 let buffer: &mut [u8] = unsafe {
                     from_raw_parts_mut(
                         ((msg.data1 & IOUSBHostCINormalTransferData1Buffer)
@@ -931,7 +920,7 @@ fn doorbell_handler(
                                 dir,
                                 (endpoint_address & 0x0f) as u32,
                                 0,
-                                data_length as u32,
+                                data_length,
                                 0,
                                 0,
                                 0,

@@ -16,7 +16,6 @@ const USB_COMMAND_HEADER_SIZE: usize = 20;
 type UsbIpSeqnum = u32;
 type UsbIpResult<T> = Result<T, anyhow::Error>;
 
-#[derive(Debug)]
 pub struct Interface {
     interface_class: u8,
     interface_subclass: u8,
@@ -30,6 +29,16 @@ impl Interface {
             interface_subclass,
             interface_protocol,
         }
+    }
+}
+
+impl Debug for Interface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Interface")
+            .field("class", &self.interface_class)
+            .field("subclass", &self.interface_subclass)
+            .field("protocol", &self.interface_protocol)
+            .finish()
     }
 }
 
@@ -271,7 +280,6 @@ impl UsbCommandSubmit {
     }
 }
 
-#[derive(Debug)]
 pub struct UsbReturnSubmit {
     header: UsbCommandHeader,
     status: u32,
@@ -315,11 +323,27 @@ impl UsbReturnSubmit {
     }
 }
 
+impl Debug for UsbReturnSubmit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsbReturnSubmit")
+            .field("header", &self.header)
+            .field("status", &self.status)
+            .field("actual_length", &self.actual_length)
+            .field("start_frame", &self.start_frame)
+            .field("number_of_packets", &self.number_of_packets)
+            .field("error_count", &self.error_count)
+            .field("buffer", &self.buffer)
+            .finish()
+    }
+}
+
+type PendingTransactions = HashMap<UsbIpSeqnum, (UsbIpDirection, oneshot::Sender<UsbReturnSubmit>)>;
+
 pub struct UsbIpClient {
     stream: Option<TcpStream>,
     imported_device: Option<Device>,
     seqnum: u32,
-    pending: Arc<Mutex<HashMap<UsbIpSeqnum, (UsbIpDirection, oneshot::Sender<UsbReturnSubmit>)>>>,
+    pending: Arc<Mutex<PendingTransactions>>,
 }
 
 unsafe impl Send for UsbIpClient {}
@@ -425,7 +449,7 @@ impl UsbIpClient {
 
         let response = rx
             .await
-            .map_err(|_| Error::new(std::io::ErrorKind::Other, "Failed to receive response"))?;
+            .map_err(|_| Error::other("Failed to receive response"))?;
 
         Ok(response)
     }
