@@ -76,7 +76,8 @@ pub struct ForceableSend<T>(pub T);
 unsafe impl<T> Send for ForceableSend<T> {}
 unsafe impl<T> Sync for ForceableSend<T> {}
 
-type CommandHandlerArgs = dyn Fn(NonNull<IOUSBHostControllerInterface>, NonNull<IOUSBHostCIDoorbell>, u32);
+type CommandHandlerArgs =
+    dyn Fn(NonNull<IOUSBHostControllerInterface>, NonNull<IOUSBHostCIDoorbell>, u32);
 
 #[derive(Debug)]
 pub struct ControllerInterface {
@@ -166,9 +167,7 @@ impl ControllerInterface {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|e| {
-                Error::other(format!("Failed to create runtime: {}", e))
-            })
+            .map_err(|e| Error::other(format!("Failed to create runtime: {}", e)))
     }
 
     fn create_command_block(
@@ -185,8 +184,7 @@ impl ControllerInterface {
         devices: Rc<RefCell<Vec<Device>>>,
         usbip_client: Arc<UnsafeCell<UsbIpClient>>,
         rt: Rc<RefCell<Runtime>>,
-    ) -> RcBlock<CommandHandlerArgs>
-    {
+    ) -> RcBlock<CommandHandlerArgs> {
         RcBlock::new(fnmut_to_fn3(move |a, b, c| {
             let dev: &mut Vec<Device> = unsafe { &mut *devices.as_ptr() };
             doorbell_handler(a, b, c, dev, Arc::clone(&usbip_client), &rt.borrow())
@@ -198,9 +196,8 @@ impl ControllerInterface {
         port_capabilities: &mut IOUSBHostCIMessage,
     ) -> Result<Retained<NSMutableData>, Error> {
         unsafe {
-            let data = NSMutableData::dataWithLength(0).ok_or_else(|| {
-                Error::other("Failed to create NSMutableData")
-            })?;
+            let data = NSMutableData::dataWithLength(0)
+                .ok_or_else(|| Error::other("Failed to create NSMutableData"))?;
 
             data.appendBytes_length(
                 NonNull::new_unchecked(capabilities as *mut _ as *mut c_void),
