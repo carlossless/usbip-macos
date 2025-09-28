@@ -1,6 +1,7 @@
+use core::panic;
 use std::{
     borrow::BorrowMut,
-    cell::{RefCell, UnsafeCell},
+    cell::{LazyCell, RefCell, UnsafeCell},
     cmp::min,
     ffi::{c_ulong, CStr},
     io::Error,
@@ -9,7 +10,7 @@ use std::{
     ptr::NonNull,
     rc::Rc,
     slice::from_raw_parts_mut,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use block2::RcBlock;
@@ -76,14 +77,21 @@ pub struct ForceableSend<T>(pub T);
 unsafe impl<T> Send for ForceableSend<T> {}
 unsafe impl<T> Sync for ForceableSend<T> {}
 
+static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::other(format!("Failed to create runtime: {}", e)))
+        .unwrap()
+});
+
 type CommandHandlerArgs =
     dyn Fn(NonNull<IOUSBHostControllerInterface>, NonNull<IOUSBHostCIDoorbell>, u32);
 
 #[derive(Debug)]
 pub struct ControllerInterface {
-    _control_interface: Retained<IOUSBHostControllerInterface>,
+    pub _control_interface: Retained<IOUSBHostControllerInterface>,
     _devices: Rc<RefCell<Vec<Device>>>,
-    _rt: Rc<RefCell<Runtime>>,
 }
 
 /// Convert FnMut to Fn for use with Objective-C blocks
@@ -109,17 +117,14 @@ impl ControllerInterface {
         let mut capabilities = Self::create_controller_capabilities();
         let mut port_capabilities = Self::create_port_capabilities();
 
-        let rt = Self::create_runtime()?;
         let devices = Rc::new(RefCell::new(Vec::new()));
 
         let (devices_cmd, devices_db) = (Rc::clone(&devices), Rc::clone(&devices));
         let (usbip_client_cmd, usbip_client_db) =
             (Arc::clone(&usbip_client), Arc::clone(&usbip_client));
-        let rt = Rc::new(RefCell::new(rt));
-        let rt_db = Rc::clone(&rt);
 
         let command_block = Self::create_command_block(devices_cmd, usbip_client_cmd);
-        let doorbell_block = Self::create_doorbell_block(devices_db, usbip_client_db, rt_db);
+        let doorbell_block = Self::create_doorbell_block(devices_db, usbip_client_db);
 
         let capabilities_data =
             Self::create_capabilities_data(&mut capabilities, &mut port_capabilities)?;
@@ -130,7 +135,6 @@ impl ControllerInterface {
         Ok(Self {
             _control_interface: interface,
             _devices: devices,
-            _rt: rt,
         })
     }
 
@@ -163,13 +167,6 @@ impl ControllerInterface {
         }
     }
 
-    fn create_runtime() -> Result<tokio::runtime::Runtime, Error> {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| Error::other(format!("Failed to create runtime: {}", e)))
-    }
-
     fn create_command_block(
         devices: Rc<RefCell<Vec<Device>>>,
         usbip_client: Arc<UnsafeCell<UsbIpClient>>,
@@ -183,11 +180,10 @@ impl ControllerInterface {
     fn create_doorbell_block(
         devices: Rc<RefCell<Vec<Device>>>,
         usbip_client: Arc<UnsafeCell<UsbIpClient>>,
-        rt: Rc<RefCell<Runtime>>,
     ) -> RcBlock<CommandHandlerArgs> {
         RcBlock::new(fnmut_to_fn3(move |a, b, c| {
             let dev: &mut Vec<Device> = unsafe { &mut *devices.as_ptr() };
-            doorbell_handler(a, b, c, dev, Arc::clone(&usbip_client), &rt.borrow())
+            doorbell_handler(a, b, c, dev, Arc::clone(&usbip_client))
         }))
     }
 
@@ -236,7 +232,7 @@ impl ControllerInterface {
                 let reason = unsafe { err.localizedFailureReason() }
                     .map(|r| format!(": {}", r))
                     .unwrap_or_default();
-                error!("Failed to create IOUSBHostControllerInterface{}", reason);
+                panic!("Failed to create IOUSBHostControllerInterface{}", reason);
             }
             Error::other("Failed to create IOUSBHostControllerInterface")
         })
@@ -253,9 +249,10 @@ fn command_handler(
     let msg_type = IOUSBHostCIMessageType(
         (command.control & IOUSBHostCIMessageControlType) >> IOUSBHostCIMessageControlTypePhase,
     );
-    debug!("Command type: {}", unsafe {
+    let msg_type_str = unsafe {
         CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
-    });
+    };
+    debug!("Command type: {msg_type_str}");
 
     match msg_type {
         IOUSBHostCIMessageType::ControllerPowerOn => {
@@ -356,7 +353,7 @@ fn command_handler(
                 panic!("Error: {:?}", res.err().unwrap());
             }
 
-            unsafe { port.setConnected(true) };
+            // unsafe { port.setConnected(true) };
         }
         IOUSBHostCIMessageType::PortStatus => {
             let res = unsafe {
@@ -402,7 +399,7 @@ fn command_handler(
             let res = unsafe {
                 port.updateLinkState_speed_inhibitLinkStateChange_error(
                     IOUSBHostCILinkState::U0,
-                    IOUSBHostCIDeviceSpeed::Full,
+                    IOUSBHostCIDeviceSpeed::Super,
                     false,
                 )
             };
@@ -539,7 +536,7 @@ fn command_handler(
             let res = unsafe {
                 ep.clone_state_machine().respondToCommand_status_error(
                     NonNull::from(&command),
-                    IOUSBHostCIMessageStatus::Success,
+                    IOUSBHostCIMessageStatus::Success
                 )
             };
             if res.is_err() {
@@ -597,8 +594,61 @@ fn command_handler(
                 panic!("Error: {:?}", res.err().unwrap());
             }
         }
+        IOUSBHostCIMessageType::EndpointDestroy => {
+            debug!("ENDPOINT DESTROY!");
+
+            let device_address: u8 = u8::try_from(
+                (command.data0 & IOUSBHostCICommandMessageData0DeviceAddress)
+                    >> IOUSBHostCICommandMessageData0DeviceAddressPhase,
+            )
+            .unwrap();
+            let endpoint_address: u8 = u8::try_from(
+                (command.data0 & IOUSBHostCICommandMessageData0EndpointAddress)
+                    >> IOUSBHostCICommandMessageData0EndpointAddressPhase,
+            )
+            .unwrap();
+
+            // FIXME: select devices by address as index
+            let dev = devices
+                .iter()
+                .find(|dev| {
+                    let address = u8::try_from(dev.device_address()).unwrap();
+                    address == device_address
+                })
+                .unwrap();
+
+            // FIXME: select devices by address as index
+            let ep = dev
+                .endpoints()
+                .iter()
+                .find(|ep| {
+                    let address = u8::try_from(ep.endpoint_address()).unwrap();
+                    address == endpoint_address
+                })
+                .unwrap();
+
+            let res = unsafe {
+                ep.clone_state_machine()
+                    .inspectCommand_error(NonNull::from(&command))
+            };
+            if res.is_err() {
+                panic!("Error: {:?}", res.err().unwrap());
+            }
+
+            // TODO: cancel any ongoing transfers for the endpoint
+
+            let res = unsafe {
+                ep.clone_state_machine().respondToCommand_status_error(
+                    NonNull::from(&command),
+                    IOUSBHostCIMessageStatus::Success,
+                )
+            };
+            if res.is_err() {
+                panic!("Error: {:?}", res.err().unwrap());
+            }
+        }
         _ => {
-            panic!("Unknown message type");
+            panic!("Unimplemented handling message type: {msg_type_str}");
         }
     }
 }
@@ -609,7 +659,6 @@ fn doorbell_handler(
     doorbell_count: u32,
     devices: &mut [Device],
     client: Arc<UnsafeCell<UsbIpClient>>,
-    rt: &Runtime,
 ) {
     debug!(
         "Doorbell handler called with doorbell: {:?}",
@@ -764,7 +813,7 @@ fn doorbell_handler(
                         UsbIpDirection::UsbDirOut => buffer.to_vec(),
                     };
 
-                    let ret = rt
+                    let ret = RUNTIME
                         .block_on(async {
                             debug!("Submitting setup transfer...");
                             unsafe {
@@ -782,6 +831,7 @@ fn doorbell_handler(
                                         0,
                                         setup_bytes.to_le_bytes(),
                                         &transfer_buffer,
+                                        &[],
                                     )
                                     .await
                             }
@@ -790,17 +840,18 @@ fn doorbell_handler(
 
                     debug!("Submit result: {:?}", ret);
 
-                    let real_length = min(ret.buffer.len(), data_length as usize);
-                    if (real_length as u32) != data_length {
-                        debug!(
-                            "WARN: Data length mismatch: {} != {}",
-                            real_length, data_length
-                        );
-                    }
+                    let response_length = ret.buffer.len();
+                    // let response_length = min(ret.buffer.len(), data_length as usize);
+                    // if (response_length as u32) != data_length {
+                    //     debug!(
+                    //         "WARN: Data length mismatch: {} != {}",
+                    //         response_length, data_length
+                    //     );
+                    // }
 
                     if dir == UsbIpDirection::UsbDirIn {
                         debug!("Copying data to buffer...");
-                        buffer[..real_length].copy_from_slice(&ret.buffer[..real_length as usize]);
+                        buffer[..response_length].copy_from_slice(&ret.buffer[..response_length as usize]);
                     }
 
                     let res = unsafe {
@@ -813,6 +864,39 @@ fn doorbell_handler(
                     if res.is_err() {
                         panic!("Error: {:?}", res.err().unwrap());
                     }
+                } else {
+                    let dir = if (request_type & 0x80) != 0 {
+                        UsbIpDirection::UsbDirIn
+                    } else {
+                        UsbIpDirection::UsbDirOut
+                    };
+
+                    let ret = RUNTIME
+                        .block_on(async {
+                            debug!("Submitting setup transfer...");
+                            unsafe {
+                                cl.borrow_mut()
+                                    .get()
+                                    .as_mut()
+                                    .unwrap()
+                                    .cmd_submit(
+                                        dir,
+                                        (endpoint_address & 0x0f) as u32,
+                                        0,
+                                        length as u32,
+                                        0,
+                                        0,
+                                        0,
+                                        setup_bytes.to_le_bytes(),
+                                        &[],
+                                        &[],
+                                    )
+                                    .await
+                            }
+                        })
+                        .unwrap();
+
+                    debug!("Submit result: {:?}", ret);
                 }
 
                 let msg = unsafe { ep.currentTransferMessage().as_ref() };
@@ -887,9 +971,9 @@ fn doorbell_handler(
                 };
 
                 debug!("Length: {}", data_length);
-                debug!("Buffer: {:?}", buffer);
+                // debug!("Buffer: {:?}", buffer);
 
-                let dir = if (endpoint_address & 0x00000080) != 0 {
+                let dir = if (endpoint_address & 0x80) != 0 {
                     UsbIpDirection::UsbDirIn
                 } else {
                     UsbIpDirection::UsbDirOut
@@ -899,7 +983,9 @@ fn doorbell_handler(
                 let ep_ptr = ForceableSend(ep.clone());
                 let client = ForceableSend(client.clone());
 
-                rt.spawn(async move {
+                debug!("msg address 1: {:p}", msg as *const _);
+
+                RUNTIME.spawn(async move {
                     let transfer_buffer = if dir == UsbIpDirection::UsbDirIn {
                         vec![]
                     } else {
@@ -916,13 +1002,15 @@ fn doorbell_handler(
                             .cmd_submit(
                                 dir,
                                 (endpoint_address & 0x0f) as u32,
+                                // endpoint_address as u32,
                                 0,
                                 data_length,
-                                0,
-                                0,
-                                0,
+                                0, // unimplemented
+                                0, // unimplemented
+                                2000,
                                 [0, 0, 0, 0, 0, 0, 0, 0],
                                 &transfer_buffer,
+                                &[] // unimplemented
                             )
                             .await
                     }
@@ -949,6 +1037,9 @@ fn doorbell_handler(
                         let ep_ptr = ep_ptr;
                         let ep = ep_ptr.0;
 
+                        let msg1 = unsafe { ep.currentTransferMessage().as_ref() };
+                        debug!("msg address 2: {:p}", msg1 as *const _);
+
                         let res = unsafe {
                             ep.enqueueTransferCompletionForMessage_status_transferLength_error(
                                 NonNull::from(msg),
@@ -957,7 +1048,16 @@ fn doorbell_handler(
                             )
                         };
                         if res.is_err() {
-                            panic!("Error: {:?}", res.err().unwrap());
+                            let err = res.err().unwrap();
+                            if err.code() != -536870206 {
+                                let localized_desc = err.localizedDescription();
+                                let localized_failure_reason = unsafe { err.localizedFailureReason() };
+                                panic!("Error: {:?}, {:?}, {:?}", err, localized_desc, localized_failure_reason);
+                            } else {
+                                debug!("Transfer no longer active");
+                                // TODO: unlink
+                                return;
+                            }
                         }
 
                         let msg = unsafe { ep.currentTransferMessage().as_ref() };
@@ -970,41 +1070,351 @@ fn doorbell_handler(
                             CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
                         });
 
-                        if msg_type != IOUSBHostCIMessageType::Link {
-                            panic!("Message is not a link");
-                        }
+                        match msg_type {
+                            IOUSBHostCIMessageType::NormalTransfer => {
+                                if msg.control & IOUSBHostCIMessageControlNoResponse != 0 {
+                                    panic!("Message should need a response");
+                                }
 
-                        if msg.control & IOUSBHostCIMessageControlValid != 0 {
-                            // panic!("Message should be valid");
-                            debug!("Message is valid");
-                            return;
-                        }
+                                if msg.control & IOUSBHostCIMessageControlValid == 0 {
+                                    panic!("Message should be valid");
+                                }
 
-                        if msg.control & IOUSBHostCIMessageControlNoResponse == 0 {
-                            let res = unsafe {
-                                ep.enqueueTransferCompletionForMessage_status_transferLength_error(
-                                    NonNull::from(msg),
-                                    IOUSBHostCIMessageStatus::Success,
-                                    0,
-                                )
-                            };
-                            if res.is_err() {
-                                panic!("Error: {:?}", res.err().unwrap());
+                                let data_length: u32 = (msg.data0 & IOUSBHostCINormalTransferData0Length)
+                                    >> IOUSBHostCINormalTransferData0LengthPhase;
+                                let buffer: &mut [u8] = unsafe {
+                                    from_raw_parts_mut(
+                                        ((msg.data1 & IOUSBHostCINormalTransferData1Buffer)
+                                            >> IOUSBHostCINormalTransferData1BufferPhase)
+                                            as *mut _,
+                                        data_length as usize,
+                                    )
+                                };
+
+                                debug!("Length: {}", data_length);
+                                // debug!("Buffer: {:?}", buffer);
+
+                                let dir = if (endpoint_address & 0x80) != 0 {
+                                    UsbIpDirection::UsbDirIn
+                                } else {
+                                    UsbIpDirection::UsbDirOut
+                                };
+
+                                let client = client;
+                                let ep_ptr = ForceableSend(ep.clone());
+                                let client = ForceableSend(client.0.clone());
+
+                                RUNTIME.spawn(async move {
+                                    let transfer_buffer = if dir == UsbIpDirection::UsbDirIn {
+                                        vec![]
+                                    } else {
+                                        buffer.to_vec()
+                                    };
+                                    let mut client = client;
+                                    let ret = unsafe {
+                                        client
+                                            .0
+                                            .borrow_mut()
+                                            .get()
+                                            .as_mut()
+                                            .unwrap()
+                                            .cmd_submit(
+                                                dir,
+                                                (endpoint_address & 0x0f) as u32,
+                                                // endpoint_address as u32,
+                                                0,
+                                                data_length,
+                                                0, // unimplemented
+                                                0, // unimplemented
+                                                2000,
+                                                [0, 0, 0, 0, 0, 0, 0, 0],
+                                                &transfer_buffer,
+                                                &[] // unimplemented
+                                            )
+                                            .await
+                                    }
+                                    .unwrap();
+                                    run_on_main(move |_| {
+                                        debug!("Submit result: {:?}", ret);
+
+                                        let real_length = min(ret.buffer.len(), data_length as usize);
+                                        if (real_length as u32) != data_length {
+                                            debug!(
+                                                "WARN: Data length mismatch: {} != {}",
+                                                real_length, data_length
+                                            );
+                                        }
+
+                                        if dir == UsbIpDirection::UsbDirIn {
+                                            debug!("Copying data to buffer...");
+                                            buffer[..real_length]
+                                                .copy_from_slice(&ret.buffer[..real_length as usize]);
+                                        } else {
+                                            debug!("Copying data from buffer... NOT IMPLEMENTED");
+                                        }
+
+                                        let ep_ptr = ep_ptr;
+                                        let ep = ep_ptr.0;
+
+                                        let res = unsafe {
+                                            ep.enqueueTransferCompletionForMessage_status_transferLength_error(
+                                                NonNull::from(msg),
+                                                IOUSBHostCIMessageStatus::Success,
+                                                data_length as usize,
+                                            )
+                                        };
+                                        if res.is_err() {
+                                            let err = res.err().unwrap();
+                                            let localized_desc = err.localizedDescription();
+                                            let localized_failure_reason = unsafe { err.localizedFailureReason() };
+                                            panic!("Error: {:?}, {:?}, {:?}", err, localized_desc, localized_failure_reason);
+                                        }
+
+                                        let msg = unsafe { ep.currentTransferMessage().as_ref() };
+
+                                        let msg_type = IOUSBHostCIMessageType(
+                                            (msg.control & IOUSBHostCIMessageControlType)
+                                                >> IOUSBHostCIMessageControlTypePhase,
+                                        );
+                                        debug!("MSG type: {}", unsafe {
+                                            CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
+                                        });
+
+                                        match msg_type {
+                                            IOUSBHostCIMessageType::NormalTransfer => {
+                                                if msg.control & IOUSBHostCIMessageControlNoResponse != 0 {
+                                                    panic!("Message should need a response");
+                                                }
+
+                                                if msg.control & IOUSBHostCIMessageControlValid == 0 {
+                                                    panic!("Message should be valid");
+                                                }
+
+                                                let data_length: u32 = (msg.data0 & IOUSBHostCINormalTransferData0Length)
+                                                    >> IOUSBHostCINormalTransferData0LengthPhase;
+                                                let buffer: &mut [u8] = unsafe {
+                                                    from_raw_parts_mut(
+                                                        ((msg.data1 & IOUSBHostCINormalTransferData1Buffer)
+                                                            >> IOUSBHostCINormalTransferData1BufferPhase)
+                                                            as *mut _,
+                                                        data_length as usize,
+                                                    )
+                                                };
+
+                                                debug!("Length: {}", data_length);
+                                                // debug!("Buffer: {:?}", buffer);
+
+                                                let dir = if (endpoint_address & 0x80) != 0 {
+                                                    UsbIpDirection::UsbDirIn
+                                                } else {
+                                                    UsbIpDirection::UsbDirOut
+                                                };
+
+                                                let client = client;
+                                                let ep_ptr = ForceableSend(ep.clone());
+                                                let client = ForceableSend(client.0.clone());
+
+                                                RUNTIME.spawn(async move {
+                                                    let transfer_buffer = if dir == UsbIpDirection::UsbDirIn {
+                                                        vec![]
+                                                    } else {
+                                                        buffer.to_vec()
+                                                    };
+                                                    let mut client = client;
+                                                    let ret = unsafe {
+                                                        client
+                                                            .0
+                                                            .borrow_mut()
+                                                            .get()
+                                                            .as_mut()
+                                                            .unwrap()
+                                                            .cmd_submit(
+                                                                dir,
+                                                                (endpoint_address & 0x0f) as u32,
+                                                                // endpoint_address as u32,
+                                                                0,
+                                                                data_length,
+                                                                0, // unimplemented
+                                                                0, // unimplemented
+                                                                2000,
+                                                                [0, 0, 0, 0, 0, 0, 0, 0],
+                                                                &transfer_buffer,
+                                                                &[] // unimplemented
+                                                            )
+                                                            .await
+                                                    }
+                                                    .unwrap();
+                                                    run_on_main(move |_| {
+                                                        debug!("Submit result: {:?}", ret);
+
+                                                        let real_length = min(ret.buffer.len(), data_length as usize);
+                                                        if (real_length as u32) != data_length {
+                                                            debug!(
+                                                                "WARN: Data length mismatch: {} != {}",
+                                                                real_length, data_length
+                                                            );
+                                                        }
+
+                                                        if dir == UsbIpDirection::UsbDirIn {
+                                                            debug!("Copying data to buffer...");
+                                                            buffer[..real_length]
+                                                                .copy_from_slice(&ret.buffer[..real_length as usize]);
+                                                        } else {
+                                                            debug!("Copying data from buffer... NOT IMPLEMENTED");
+                                                        }
+
+                                                        let ep_ptr = ep_ptr;
+                                                        let ep = ep_ptr.0;
+
+                                                        let res = unsafe {
+                                                            ep.enqueueTransferCompletionForMessage_status_transferLength_error(
+                                                                NonNull::from(msg),
+                                                                IOUSBHostCIMessageStatus::Success,
+                                                                data_length as usize,
+                                                            )
+                                                        };
+                                                        if res.is_err() {
+                                                            let err = res.err().unwrap();
+                                                            let localized_desc = err.localizedDescription();
+                                                            let localized_failure_reason = unsafe { err.localizedFailureReason() };
+                                                            panic!("Error: {:?}, {:?}, {:?}", err, localized_desc, localized_failure_reason);
+                                                        }
+
+                                                        let msg = unsafe { ep.currentTransferMessage().as_ref() };
+
+                                                        let msg_type = IOUSBHostCIMessageType(
+                                                            (msg.control & IOUSBHostCIMessageControlType)
+                                                                >> IOUSBHostCIMessageControlTypePhase,
+                                                        );
+                                                        debug!("MSG type: {}", unsafe {
+                                                            CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
+                                                        });
+
+                                                        match msg_type {
+                                                            IOUSBHostCIMessageType::NormalTransfer => {
+                                                                panic!("Normal transfer not implemented");
+                                                            }
+                                                            IOUSBHostCIMessageType::Link => {
+                                                                if msg.control & IOUSBHostCIMessageControlValid != 0 {
+                                                                    // panic!("Message should be valid");
+                                                                    debug!("Message is valid");
+                                                                    return;
+                                                                }
+
+                                                                if msg.control & IOUSBHostCIMessageControlNoResponse == 0 {
+                                                                    let res = unsafe {
+                                                                        ep.enqueueTransferCompletionForMessage_status_transferLength_error(
+                                                                            NonNull::from(msg),
+                                                                            IOUSBHostCIMessageStatus::Success,
+                                                                            0,
+                                                                        )
+                                                                    };
+                                                                    if res.is_err() {
+                                                                        panic!("Error: {:?}", res.err().unwrap());
+                                                                    }
+
+                                                                    let msg = unsafe { ep.currentTransferMessage().as_ref() };
+
+                                                                    let msg_type = IOUSBHostCIMessageType(
+                                                                        (msg.control & IOUSBHostCIMessageControlType)
+                                                                            >> IOUSBHostCIMessageControlTypePhase,
+                                                                    );
+                                                                    debug!("MSG type: {}", unsafe {
+                                                                        CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
+                                                                    });
+
+                                                                    if msg.control & IOUSBHostCIMessageControlValid != 0 {
+                                                                        debug!("Message is valid");
+                                                                        return;
+                                                                    }
+                                                                }
+                                                            }
+                                                            t => {
+                                                                panic!("Unexpected message type: {:?}", t);
+                                                            }
+                                                        }
+                                                    });
+                                                });
+                                            }
+                                            IOUSBHostCIMessageType::Link => {
+                                                if msg.control & IOUSBHostCIMessageControlValid != 0 {
+                                                    // panic!("Message should be valid");
+                                                    debug!("Message is valid");
+                                                    return;
+                                                }
+
+                                                if msg.control & IOUSBHostCIMessageControlNoResponse == 0 {
+                                                    let res = unsafe {
+                                                        ep.enqueueTransferCompletionForMessage_status_transferLength_error(
+                                                            NonNull::from(msg),
+                                                            IOUSBHostCIMessageStatus::Success,
+                                                            0,
+                                                        )
+                                                    };
+                                                    if res.is_err() {
+                                                        panic!("Error: {:?}", res.err().unwrap());
+                                                    }
+
+                                                    let msg = unsafe { ep.currentTransferMessage().as_ref() };
+
+                                                    let msg_type = IOUSBHostCIMessageType(
+                                                        (msg.control & IOUSBHostCIMessageControlType)
+                                                            >> IOUSBHostCIMessageControlTypePhase,
+                                                    );
+                                                    debug!("MSG type: {}", unsafe {
+                                                        CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
+                                                    });
+
+                                                    if msg.control & IOUSBHostCIMessageControlValid != 0 {
+                                                        debug!("Message is valid");
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            t => {
+                                                panic!("Unexpected message type: {:?}", t);
+                                            }
+                                        }
+                                    });
+                                });
                             }
+                            IOUSBHostCIMessageType::Link => {
+                                if msg.control & IOUSBHostCIMessageControlValid != 0 {
+                                    // panic!("Message should be valid");
+                                    debug!("Message is valid");
+                                    return;
+                                }
 
-                            let msg = unsafe { ep.currentTransferMessage().as_ref() };
+                                if msg.control & IOUSBHostCIMessageControlNoResponse == 0 {
+                                    let res = unsafe {
+                                        ep.enqueueTransferCompletionForMessage_status_transferLength_error(
+                                            NonNull::from(msg),
+                                            IOUSBHostCIMessageStatus::Success,
+                                            0,
+                                        )
+                                    };
+                                    if res.is_err() {
+                                        panic!("Error: {:?}", res.err().unwrap());
+                                    }
 
-                            let msg_type = IOUSBHostCIMessageType(
-                                (msg.control & IOUSBHostCIMessageControlType)
-                                    >> IOUSBHostCIMessageControlTypePhase,
-                            );
-                            debug!("MSG type: {}", unsafe {
-                                CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
-                            });
+                                    let msg = unsafe { ep.currentTransferMessage().as_ref() };
 
-                            if msg.control & IOUSBHostCIMessageControlValid != 0 {
-                                debug!("Message is valid");
-                                return;
+                                    let msg_type = IOUSBHostCIMessageType(
+                                        (msg.control & IOUSBHostCIMessageControlType)
+                                            >> IOUSBHostCIMessageControlTypePhase,
+                                    );
+                                    debug!("MSG type: {}", unsafe {
+                                        CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
+                                    });
+
+                                    if msg.control & IOUSBHostCIMessageControlValid != 0 {
+                                        debug!("Message is valid");
+                                        return;
+                                    }
+                                }
+                            }
+                            t => {
+                                panic!("Unexpected message type: {:?}", t);
                             }
                         }
                     });

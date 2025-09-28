@@ -7,6 +7,7 @@ use dispatch2::dispatch_main;
 use log::debug;
 use simple_logger::SimpleLogger;
 use usbip::UsbIpClient;
+use std::io::{self, Write};
 
 mod controller_interface;
 mod device;
@@ -191,17 +192,28 @@ fn attach(addr: &str, config: AttachConfig) -> ! {
     }
 
     let ci_client = Arc::new(UnsafeCell::new(client));
-    let usbip_client = ForceableSend(Arc::clone(&ci_client));
+    let usbip_client_1 = ForceableSend(Arc::clone(&ci_client));
+    let usbip_client_2 = ForceableSend(Arc::clone(&ci_client));
 
-    let _con_iface = match ControllerInterface::new(ci_client) {
-        Ok(iface) => iface,
-        Err(e) => {
-            eprintln!("Error creating controller interface: {}", e);
-            process::exit(1);
-        }
-    };
+    std::thread::spawn(move || {
+        let z = usbip_client_1;
+        let t = z.0;
+        let _con_iface = match ControllerInterface::new(t) {
+            Ok(iface) => iface,
+            Err(e) => {
+                eprintln!("Error creating controller interface: {}", e);
+                process::exit(1);
+            }
+        };
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        print!("Waiting for Enter to continue plugging in port...");
+        io::stdout().flush().unwrap();
+        let _ = io::stdin().read_line(&mut String::new());
+        let port = unsafe { _con_iface._control_interface.getPortStateMachineForPort_error(1).unwrap() };
+        unsafe { port.setConnected(true) };
+    });
 
-    spawn_polling_task(&rt, usbip_client);
+    spawn_polling_task(&rt, usbip_client_2);
     dispatch_main()
 }
 

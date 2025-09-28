@@ -16,6 +16,32 @@ const USB_COMMAND_HEADER_SIZE: usize = 20;
 type UsbIpSeqnum = u32;
 type UsbIpResult<T> = Result<T, anyhow::Error>;
 
+#[derive(Debug)]
+pub enum UsbIpSpeed {
+    Unknown = 0,
+    Low = 1,
+    Full = 2,
+    High = 3,
+    Wireless = 4,
+    Super = 5,
+    SuperPlus = 6,
+}
+
+impl UsbIpSpeed {
+    fn from_u32(value: u32) -> Self {
+        match value {
+            0 => Self::Unknown,
+            1 => Self::Low,
+            2 => Self::Full,
+            3 => Self::High,
+            4 => Self::Wireless,
+            5 => Self::Super,
+            6 => Self::SuperPlus,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 pub struct Interface {
     interface_class: u8,
     interface_subclass: u8,
@@ -47,7 +73,7 @@ pub struct Device {
     busid: [u8; 32],
     busnum: u32,
     devnum: u32,
-    speed: u32,
+    speed: UsbIpSpeed,
     id_vendor: u16,
     id_product: u16,
     bcd_device: u16,
@@ -67,7 +93,7 @@ impl Device {
         busid: [u8; 32],
         busnum: u32,
         devnum: u32,
-        speed: u32,
+        speed: UsbIpSpeed,
         id_vendor: u16,
         id_product: u16,
         bcd_device: u16,
@@ -129,7 +155,7 @@ impl Debug for Device {
             .field("speed", &self.speed)
             .field("id_vendor", &format_args!("{:#06x}", self.id_vendor))
             .field("id_product", &format_args!("{:#06x}", self.id_product))
-            .field("bcd_device", &self.bcd_device)
+            .field("bcd_device", &format_args!("{:#06x}", self.bcd_device))
             .field("device_class", &self.device_class)
             .field("device_subclass", &self.device_subclass)
             .field("device_protocol", &self.device_protocol)
@@ -240,6 +266,7 @@ pub struct UsbCommandSubmit {
     interval: u32,
     setup_bytes: [u8; SETUP_BYTES_SIZE],
     transfer_buffer: Vec<u8>,
+    iso_packet_descriptor: Vec<u8>,
 }
 
 impl UsbCommandSubmit {
@@ -253,7 +280,19 @@ impl UsbCommandSubmit {
         interval: u32,
         setup_bytes: [u8; SETUP_BYTES_SIZE],
         transfer_buffer: Vec<u8>,
+        iso_packet_descriptor: Vec<u8>,
     ) -> Self {
+        let actual_number_of_packets = if number_of_packets == 0xffffffff {
+            0
+        } else {
+            number_of_packets
+        };
+
+        if actual_number_of_packets != iso_packet_descriptor.len() as u32 {
+            error!("Actual number of packets ({}) does not match ISO packet descriptor length ({})",
+                   actual_number_of_packets, iso_packet_descriptor.len());
+        }
+
         Self {
             header,
             transfer_flags,
@@ -263,6 +302,7 @@ impl UsbCommandSubmit {
             interval,
             setup_bytes,
             transfer_buffer,
+            iso_packet_descriptor,
         }
     }
 
@@ -276,6 +316,7 @@ impl UsbCommandSubmit {
         buf.put_u32(self.interval);
         buf.put(&self.setup_bytes[..]);
         buf.put(&self.transfer_buffer[..]);
+        buf.put(&self.iso_packet_descriptor[..]);
         buf
     }
 }
@@ -288,6 +329,7 @@ pub struct UsbReturnSubmit {
     number_of_packets: u32,
     error_count: u32,
     pub buffer: Vec<u8>,
+    pub iso_packet_descriptor: Vec<u8>,
 }
 
 impl UsbReturnSubmit {
@@ -299,9 +341,14 @@ impl UsbReturnSubmit {
         let status = stream.read_u32().await?;
         let actual_length = stream.read_u32().await?;
         let start_frame = stream.read_u32().await?;
-        let number_of_packets = stream.read_u32().await?;
+        let mut number_of_packets = stream.read_u32().await?;
+
+        if number_of_packets == 0xffffffff { // If the value is 0xffffffff, it means no packets were sent, but most server implementations send 0 in this case
+            number_of_packets = 0;
+        }
+
         let error_count = stream.read_u32().await?;
-        stream.read_u64().await?;
+        stream.read_u64().await?; // padding
 
         let buffer = if direction == UsbIpDirection::UsbDirIn {
             let mut buf = vec![0; actual_length as usize];
@@ -309,6 +356,12 @@ impl UsbReturnSubmit {
             buf
         } else {
             vec![]
+        };
+
+        let iso_packet_descriptor = {
+            let mut buf = vec![0; number_of_packets as usize * 16];
+            stream.read_exact(&mut buf).await?;
+            buf
         };
 
         Ok(Self {
@@ -319,6 +372,7 @@ impl UsbReturnSubmit {
             number_of_packets,
             error_count,
             buffer,
+            iso_packet_descriptor,
         })
     }
 }
@@ -333,6 +387,7 @@ impl Debug for UsbReturnSubmit {
             .field("number_of_packets", &self.number_of_packets)
             .field("error_count", &self.error_count)
             .field("buffer", &self.buffer)
+            .field("iso_packet_descriptor", &self.iso_packet_descriptor)
             .finish()
     }
 }
@@ -419,6 +474,7 @@ impl UsbIpClient {
         interval: u32,
         setup_bytes: [u8; SETUP_BYTES_SIZE],
         transfer_buffer: &[u8],
+        iso_packet_descriptor: &[u8],
     ) -> UsbIpResult<UsbReturnSubmit> {
         self.seqnum = self.seqnum.wrapping_add(1);
         let seqnum = self.seqnum;
@@ -436,6 +492,7 @@ impl UsbIpClient {
                 interval,
                 setup_bytes,
                 transfer_buffer,
+                iso_packet_descriptor,
             )
         };
 
@@ -474,9 +531,16 @@ impl UsbIpClient {
         let pending_request = self.pending.lock().await.remove(&seqnum);
 
         if let Some((direction, tx)) = pending_request {
-            let response =
-                UsbReturnSubmit::from_header_and_stream(direction, header, stream).await?;
-            let _ = tx.send(response);
+            match header.command {
+                0x03 => {
+                    let response =
+                        UsbReturnSubmit::from_header_and_stream(direction, header, stream).await?;
+                    let _ = tx.send(response);
+                }
+                _ => {
+                    error!("Received unexpected command: {}", header.command);
+                }
+            }
         } else {
             error!("Received response with unknown seqnum: {}", seqnum);
         }
@@ -541,7 +605,7 @@ impl UsbIpClient {
 
         let busnum = stream.read_u32().await?;
         let devnum = stream.read_u32().await?;
-        let speed = stream.read_u32().await?;
+        let speed = UsbIpSpeed::from_u32(stream.read_u32().await?);
         let id_vendor = stream.read_u16().await?;
         let id_product = stream.read_u16().await?;
         let bcd_device = stream.read_u16().await?;
@@ -557,7 +621,7 @@ impl UsbIpClient {
             let interface_class = stream.read_u8().await?;
             let interface_subclass = stream.read_u8().await?;
             let interface_protocol = stream.read_u8().await?;
-            stream.read_u8().await?;
+            stream.read_u8().await?; // padding
             interfaces.push(Interface::new(
                 interface_class,
                 interface_subclass,
@@ -591,7 +655,7 @@ impl UsbIpClient {
         stream.read_exact(&mut busid).await?;
         let busnum = stream.read_u32().await?;
         let devnum = stream.read_u32().await?;
-        let speed = stream.read_u32().await?;
+        let speed = UsbIpSpeed::from_u32(stream.read_u32().await?);
         let id_vendor = stream.read_u16().await?;
         let id_product = stream.read_u16().await?;
         let bcd_device = stream.read_u16().await?;
@@ -635,6 +699,7 @@ impl UsbIpClient {
         interval: u32,
         setup_bytes: [u8; SETUP_BYTES_SIZE],
         transfer_buffer: &[u8],
+        iso_packet_descriptor: &[u8],
     ) -> UsbCommandSubmit {
         UsbCommandSubmit::new(
             UsbCommandHeader::new(
@@ -651,6 +716,7 @@ impl UsbIpClient {
             interval,
             setup_bytes,
             transfer_buffer.to_vec(),
+            iso_packet_descriptor.to_vec()
         )
     }
 

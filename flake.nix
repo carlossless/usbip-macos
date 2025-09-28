@@ -50,6 +50,8 @@
 
         devShells.default = craneLib.devShell {
           checks = self.checks.${system};
+
+          RUST_BACKTRACE = 1;
         };
       }
     );
