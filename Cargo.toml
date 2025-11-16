@@ -4,22 +4,15 @@ version = "0.0.1"
 edition = "2021"
 
 [dependencies]
-objc2 = { git = "https://github.com/madsmtm/objc2.git", branch = "master", features = ["relax-sign-encoding"] } # https://github.com/madsmtm/objc2/issues/754
-block2 = { git = "https://github.com/madsmtm/objc2.git", branch = "master" }
-dispatch2 = { git = "https://github.com/madsmtm/objc2.git", branch = "master" }
-objc2-foundation = { git = "https://github.com/madsmtm/objc2.git", branch = "master" }
-objc2-io-usb-host = { git = "https://github.com/madsmtm/objc2.git", branch = "master" }
+objc2 = { version = "0.6", features = ["relax-sign-encoding"] } # https://github.com/madsmtm/objc2/issues/754
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2-foundation = "0.3"
+objc2-io-usb-host = "0.3"
 bytes = "1"
 tokio = { version = "1", features = ["full"] }
 clap = "4"
 clap-num = "1"
 anyhow = { version = "1", features = ["backtrace"] }
-
-[dependencies.log]
-version = "0.4"
-features = ["max_level_debug"]
-
-[dependencies.simple_logger]
-version = "5.0"
-default-features = false
-features = ["stderr", "colors", "timestamps"]
+log = { version = "0.4", features = ["max_level_debug"] }
+simple_logger = { version = "5.0", default-features = false, features = ["stderr", "colors", "timestamps"] }
