@@ -1,7 +1,7 @@
 use core::panic;
 use std::{
     borrow::BorrowMut,
-    cell::{LazyCell, RefCell, UnsafeCell},
+    cell::{RefCell, UnsafeCell},
     cmp::min,
     ffi::{c_ulong, CStr},
     io::Error,
@@ -15,7 +15,7 @@ use std::{
 
 use block2::RcBlock;
 use dispatch2::run_on_main;
-use log::{debug, error, warn};
+use log::{debug, warn};
 use objc2::{rc::Retained, AnyThread};
 use objc2_foundation::{NSError, NSMutableData};
 use objc2_io_usb_host::{
@@ -229,7 +229,7 @@ impl ControllerInterface {
 
         interface.ok_or_else(|| {
             if let Some(err) = error {
-                let reason = unsafe { err.localizedFailureReason() }
+                let reason = err.localizedFailureReason()
                     .map(|r| format!(": {}", r))
                     .unwrap_or_default();
                 panic!("Failed to create IOUSBHostControllerInterface{}", reason);
@@ -249,9 +249,7 @@ fn command_handler(
     let msg_type = IOUSBHostCIMessageType(
         (command.control & IOUSBHostCIMessageControlType) >> IOUSBHostCIMessageControlTypePhase,
     );
-    let msg_type_str = unsafe {
-        CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
-    };
+    let msg_type_str = unsafe { CStr::from_ptr(msg_type.to_string()).to_str().unwrap() };
     debug!("Command type: {msg_type_str}");
 
     match msg_type {
@@ -399,7 +397,7 @@ fn command_handler(
             let res = unsafe {
                 port.updateLinkState_speed_inhibitLinkStateChange_error(
                     IOUSBHostCILinkState::U0,
-                    IOUSBHostCIDeviceSpeed::Super,
+                    IOUSBHostCIDeviceSpeed::Full, // TODO: needs to be based on connected device speed
                     false,
                 )
             };
@@ -536,7 +534,7 @@ fn command_handler(
             let res = unsafe {
                 ep.clone_state_machine().respondToCommand_status_error(
                     NonNull::from(&command),
-                    IOUSBHostCIMessageStatus::Success
+                    IOUSBHostCIMessageStatus::Success,
                 )
             };
             if res.is_err() {
@@ -851,7 +849,8 @@ fn doorbell_handler(
 
                     if dir == UsbIpDirection::UsbDirIn {
                         debug!("Copying data to buffer...");
-                        buffer[..response_length].copy_from_slice(&ret.buffer[..response_length as usize]);
+                        buffer[..response_length]
+                            .copy_from_slice(&ret.buffer[..response_length]);
                     }
 
                     let res = unsafe {
@@ -1002,12 +1001,11 @@ fn doorbell_handler(
                             .cmd_submit(
                                 dir,
                                 (endpoint_address & 0x0f) as u32,
-                                // endpoint_address as u32,
                                 0,
                                 data_length,
                                 0, // unimplemented
                                 0, // unimplemented
-                                2000,
+                                200, // depending on usb protocol version, cannot be too high
                                 [0, 0, 0, 0, 0, 0, 0, 0],
                                 &transfer_buffer,
                                 &[] // unimplemented
@@ -1051,7 +1049,7 @@ fn doorbell_handler(
                             let err = res.err().unwrap();
                             if err.code() != -536870206 {
                                 let localized_desc = err.localizedDescription();
-                                let localized_failure_reason = unsafe { err.localizedFailureReason() };
+                                let localized_failure_reason = err.localizedFailureReason();
                                 panic!("Error: {:?}, {:?}, {:?}", err, localized_desc, localized_failure_reason);
                             } else {
                                 debug!("Transfer no longer active");
@@ -1121,12 +1119,11 @@ fn doorbell_handler(
                                             .cmd_submit(
                                                 dir,
                                                 (endpoint_address & 0x0f) as u32,
-                                                // endpoint_address as u32,
                                                 0,
                                                 data_length,
                                                 0, // unimplemented
                                                 0, // unimplemented
-                                                2000,
+                                                200, // depending on usb protocol version, cannot be too high
                                                 [0, 0, 0, 0, 0, 0, 0, 0],
                                                 &transfer_buffer,
                                                 &[] // unimplemented
@@ -1166,7 +1163,7 @@ fn doorbell_handler(
                                         if res.is_err() {
                                             let err = res.err().unwrap();
                                             let localized_desc = err.localizedDescription();
-                                            let localized_failure_reason = unsafe { err.localizedFailureReason() };
+                                            let localized_failure_reason = err.localizedFailureReason();
                                             panic!("Error: {:?}, {:?}, {:?}", err, localized_desc, localized_failure_reason);
                                         }
 
@@ -1231,12 +1228,11 @@ fn doorbell_handler(
                                                             .cmd_submit(
                                                                 dir,
                                                                 (endpoint_address & 0x0f) as u32,
-                                                                // endpoint_address as u32,
                                                                 0,
                                                                 data_length,
                                                                 0, // unimplemented
                                                                 0, // unimplemented
-                                                                2000,
+                                                                200, // depending on usb protocol version, cannot be too high
                                                                 [0, 0, 0, 0, 0, 0, 0, 0],
                                                                 &transfer_buffer,
                                                                 &[] // unimplemented
@@ -1276,7 +1272,7 @@ fn doorbell_handler(
                                                         if res.is_err() {
                                                             let err = res.err().unwrap();
                                                             let localized_desc = err.localizedDescription();
-                                                            let localized_failure_reason = unsafe { err.localizedFailureReason() };
+                                                            let localized_failure_reason = err.localizedFailureReason();
                                                             panic!("Error: {:?}, {:?}, {:?}", err, localized_desc, localized_failure_reason);
                                                         }
 
@@ -1325,7 +1321,6 @@ fn doorbell_handler(
 
                                                                     if msg.control & IOUSBHostCIMessageControlValid != 0 {
                                                                         debug!("Message is valid");
-                                                                        return;
                                                                     }
                                                                 }
                                                             }
@@ -1367,7 +1362,6 @@ fn doorbell_handler(
 
                                                     if msg.control & IOUSBHostCIMessageControlValid != 0 {
                                                         debug!("Message is valid");
-                                                        return;
                                                     }
                                                 }
                                             }
@@ -1409,7 +1403,6 @@ fn doorbell_handler(
 
                                     if msg.control & IOUSBHostCIMessageControlValid != 0 {
                                         debug!("Message is valid");
-                                        return;
                                     }
                                 }
                             }

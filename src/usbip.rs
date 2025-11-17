@@ -9,7 +9,7 @@ use tokio::{
     sync::{oneshot, Mutex},
 };
 
-const USBIP_VERSION: u16 = 0x0111;
+const USBIP_VERSION: u16 = 0x0111; // USB/IP v1.1.1
 const SETUP_BYTES_SIZE: usize = 8;
 const USB_COMMAND_HEADER_SIZE: usize = 20;
 
@@ -289,8 +289,11 @@ impl UsbCommandSubmit {
         };
 
         if actual_number_of_packets != iso_packet_descriptor.len() as u32 {
-            error!("Actual number of packets ({}) does not match ISO packet descriptor length ({})",
-                   actual_number_of_packets, iso_packet_descriptor.len());
+            error!(
+                "Actual number of packets ({}) does not match ISO packet descriptor length ({})",
+                actual_number_of_packets,
+                iso_packet_descriptor.len()
+            );
         }
 
         Self {
@@ -343,7 +346,8 @@ impl UsbReturnSubmit {
         let start_frame = stream.read_u32().await?;
         let mut number_of_packets = stream.read_u32().await?;
 
-        if number_of_packets == 0xffffffff { // If the value is 0xffffffff, it means no packets were sent, but most server implementations send 0 in this case
+        if number_of_packets == 0xffffffff {
+            // If the value is 0xffffffff, it means no packets were sent, but most server implementations send 0 in this case
             number_of_packets = 0;
         }
 
@@ -716,7 +720,7 @@ impl UsbIpClient {
             interval,
             setup_bytes,
             transfer_buffer.to_vec(),
-            iso_packet_descriptor.to_vec()
+            iso_packet_descriptor.to_vec(),
         )
     }
 

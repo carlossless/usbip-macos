@@ -6,8 +6,8 @@ use controller_interface::{ControllerInterface, ForceableSend};
 use dispatch2::dispatch_main;
 use log::debug;
 use simple_logger::SimpleLogger;
-use usbip::UsbIpClient;
 use std::io::{self, Write};
+use usbip::UsbIpClient;
 
 mod controller_interface;
 mod device;
@@ -209,7 +209,12 @@ fn attach(addr: &str, config: AttachConfig) -> ! {
         print!("Waiting for Enter to continue plugging in port...");
         io::stdout().flush().unwrap();
         let _ = io::stdin().read_line(&mut String::new());
-        let port = unsafe { _con_iface._control_interface.getPortStateMachineForPort_error(1).unwrap() };
+        let port = unsafe {
+            _con_iface
+                ._control_interface
+                .getPortStateMachineForPort_error(1)
+                .unwrap()
+        };
         unsafe { port.setConnected(true) };
     });
 
