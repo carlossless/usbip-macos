@@ -229,7 +229,8 @@ impl ControllerInterface {
 
         interface.ok_or_else(|| {
             if let Some(err) = error {
-                let reason = err.localizedFailureReason()
+                let reason = err
+                    .localizedFailureReason()
                     .map(|r| format!(": {}", r))
                     .unwrap_or_default();
                 panic!("Failed to create IOUSBHostControllerInterface{}", reason);
@@ -651,6 +652,175 @@ fn command_handler(
     }
 }
 
+/// Process normal transfers until none are left by handling them recursively
+/// Each invocation processes one transfer asynchronously, then checks for more
+fn process_normal_transfers(
+    ep: Retained<IOUSBHostCIEndpointStateMachine>,
+    endpoint_address: u8,
+    client: Arc<UnsafeCell<UsbIpClient>>,
+) {
+    let msg = unsafe { ep.currentTransferMessage().as_ref() };
+
+    // Check if message is valid
+    if msg.control & IOUSBHostCIMessageControlValid == 0 {
+        debug!("Message is not valid, stopping transfer processing");
+        return;
+    }
+
+    let msg_type = IOUSBHostCIMessageType(
+        (msg.control & IOUSBHostCIMessageControlType) >> IOUSBHostCIMessageControlTypePhase,
+    );
+
+    debug!("Processing message type: {}", unsafe {
+        CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
+    });
+
+    // Handle non-NormalTransfer messages
+    if msg_type != IOUSBHostCIMessageType::NormalTransfer {
+        if msg_type == IOUSBHostCIMessageType::Link {
+            debug!("Link message encountered");
+            if msg.control & IOUSBHostCIMessageControlValid == 0
+                && msg.control & IOUSBHostCIMessageControlNoResponse == 0
+            {
+                let res = unsafe {
+                    ep.enqueueTransferCompletionForMessage_status_transferLength_error(
+                        NonNull::from(msg),
+                        IOUSBHostCIMessageStatus::Success,
+                        0,
+                    )
+                };
+                if res.is_err() {
+                    panic!("Error: {:?}", res.err().unwrap());
+                }
+            }
+        }
+        return;
+    }
+
+    // Handle NormalTransfer
+    if msg.control & IOUSBHostCIMessageControlNoResponse != 0 {
+        panic!("Message should need a response");
+    }
+
+    let data_length: u32 = (msg.data0 & IOUSBHostCINormalTransferData0Length)
+        >> IOUSBHostCINormalTransferData0LengthPhase;
+    let buffer: &mut [u8] = unsafe {
+        from_raw_parts_mut(
+            ((msg.data1 & IOUSBHostCINormalTransferData1Buffer)
+                >> IOUSBHostCINormalTransferData1BufferPhase) as *mut _,
+            data_length as usize,
+        )
+    };
+
+    debug!("Normal transfer length: {}", data_length);
+
+    let dir = if (endpoint_address & 0x80) != 0 {
+        UsbIpDirection::UsbDirIn
+    } else {
+        UsbIpDirection::UsbDirOut
+    };
+
+    let ep_send = ForceableSend(ep.clone());
+    let client_send = ForceableSend(client.clone());
+
+    // Convert to raw pointers, then to usize to bypass Send requirement
+    // SAFETY: We ensure single-threaded access via run_on_main
+    let ep_ptr = Box::into_raw(Box::new(ep_send)) as usize;
+    let client_ptr = Box::into_raw(Box::new(client_send)) as usize;
+
+    RUNTIME.spawn(async move {
+        let transfer_buffer = if dir == UsbIpDirection::UsbDirIn {
+            vec![]
+        } else {
+            buffer.to_vec()
+        };
+
+        // SAFETY: We own these pointers and they're valid
+        let mut client_send = ForceableSend(unsafe {
+            (*(client_ptr as *mut ForceableSend<Arc<UnsafeCell<UsbIpClient>>>))
+                .0
+                .clone()
+        });
+        let ret = unsafe {
+            client_send
+                .0
+                .borrow_mut()
+                .get()
+                .as_mut()
+                .unwrap()
+                .cmd_submit(
+                    dir,
+                    (endpoint_address & 0x0f) as u32,
+                    0,
+                    data_length,
+                    0,
+                    0,
+                    10, // depending on usb protocol version, cannot be too high
+                    [0, 0, 0, 0, 0, 0, 0, 0],
+                    &transfer_buffer,
+                    &[],
+                )
+                .await
+        }
+        .unwrap();
+
+        run_on_main(move |_| {
+            debug!("Submit result: {:?}", ret);
+
+            let real_length = min(ret.buffer.len(), data_length as usize);
+            if (real_length as u32) != data_length {
+                debug!(
+                    "WARN: Data length mismatch: {} != {}",
+                    real_length, data_length
+                );
+            }
+
+            if dir == UsbIpDirection::UsbDirIn {
+                debug!("Copying data to buffer...");
+                buffer[..real_length].copy_from_slice(&ret.buffer[..real_length]);
+            }
+
+            // SAFETY: We own these pointers, reconstruct the boxes to use and drop them
+            let ep_box = unsafe {
+                Box::from_raw(
+                    ep_ptr as *mut ForceableSend<Retained<IOUSBHostCIEndpointStateMachine>>,
+                )
+            };
+            let client_box = unsafe {
+                Box::from_raw(client_ptr as *mut ForceableSend<Arc<UnsafeCell<UsbIpClient>>>)
+            };
+
+            let res = unsafe {
+                ep_box
+                    .0
+                    .enqueueTransferCompletionForMessage_status_transferLength_error(
+                        NonNull::from(msg),
+                        IOUSBHostCIMessageStatus::Success,
+                        data_length as usize,
+                    )
+            };
+
+            if res.is_err() {
+                let err = res.err().unwrap();
+                if err.code() != -536870206 {
+                    let localized_desc = err.localizedDescription();
+                    let localized_failure_reason = err.localizedFailureReason();
+                    panic!(
+                        "Error: {:?}, {:?}, {:?}",
+                        err, localized_desc, localized_failure_reason
+                    );
+                } else {
+                    debug!("Transfer no longer active");
+                    // return;
+                }
+            }
+
+            // Recursively process the next transfer (we're on main thread now)
+            process_normal_transfers(ep_box.0, endpoint_address, client_box.0);
+        });
+    });
+}
+
 fn doorbell_handler(
     _controller: NonNull<IOUSBHostControllerInterface>,
     doorbell_array: NonNull<IOUSBHostCIDoorbell>,
@@ -849,8 +1019,7 @@ fn doorbell_handler(
 
                     if dir == UsbIpDirection::UsbDirIn {
                         debug!("Copying data to buffer...");
-                        buffer[..response_length]
-                            .copy_from_slice(&ret.buffer[..response_length]);
+                        buffer[..response_length].copy_from_slice(&ret.buffer[..response_length]);
                     }
 
                     let res = unsafe {
@@ -958,460 +1127,12 @@ fn doorbell_handler(
                     panic!("Message should be valid");
                 }
 
-                let data_length: u32 = (msg.data0 & IOUSBHostCINormalTransferData0Length)
-                    >> IOUSBHostCINormalTransferData0LengthPhase;
-                let buffer: &mut [u8] = unsafe {
-                    from_raw_parts_mut(
-                        ((msg.data1 & IOUSBHostCINormalTransferData1Buffer)
-                            >> IOUSBHostCINormalTransferData1BufferPhase)
-                            as *mut _,
-                        data_length as usize,
-                    )
-                };
-
-                debug!("Length: {}", data_length);
-                // debug!("Buffer: {:?}", buffer);
-
-                let dir = if (endpoint_address & 0x80) != 0 {
-                    UsbIpDirection::UsbDirIn
-                } else {
-                    UsbIpDirection::UsbDirOut
-                };
-
-                let ep = &ep.clone_state_machine();
-                let ep_ptr = ForceableSend(ep.clone());
-                let client = ForceableSend(client.clone());
-
-                debug!("msg address 1: {:p}", msg as *const _);
-
-                RUNTIME.spawn(async move {
-                    let transfer_buffer = if dir == UsbIpDirection::UsbDirIn {
-                        vec![]
-                    } else {
-                        buffer.to_vec()
-                    };
-                    let mut client = client;
-                    let ret = unsafe {
-                        client
-                            .0
-                            .borrow_mut()
-                            .get()
-                            .as_mut()
-                            .unwrap()
-                            .cmd_submit(
-                                dir,
-                                (endpoint_address & 0x0f) as u32,
-                                0,
-                                data_length,
-                                0, // unimplemented
-                                0, // unimplemented
-                                200, // depending on usb protocol version, cannot be too high
-                                [0, 0, 0, 0, 0, 0, 0, 0],
-                                &transfer_buffer,
-                                &[] // unimplemented
-                            )
-                            .await
-                    }
-                    .unwrap();
-                    run_on_main(move |_| {
-                        debug!("Submit result: {:?}", ret);
-
-                        let real_length = min(ret.buffer.len(), data_length as usize);
-                        if (real_length as u32) != data_length {
-                            debug!(
-                                "WARN: Data length mismatch: {} != {}",
-                                real_length, data_length
-                            );
-                        }
-
-                        if dir == UsbIpDirection::UsbDirIn {
-                            debug!("Copying data to buffer...");
-                            buffer[..real_length]
-                                .copy_from_slice(&ret.buffer[..real_length as usize]);
-                        } else {
-                            debug!("Copying data from buffer... NOT IMPLEMENTED");
-                        }
-
-                        let ep_ptr = ep_ptr;
-                        let ep = ep_ptr.0;
-
-                        let msg1 = unsafe { ep.currentTransferMessage().as_ref() };
-                        debug!("msg address 2: {:p}", msg1 as *const _);
-
-                        let res = unsafe {
-                            ep.enqueueTransferCompletionForMessage_status_transferLength_error(
-                                NonNull::from(msg),
-                                IOUSBHostCIMessageStatus::Success,
-                                data_length as usize,
-                            )
-                        };
-                        if res.is_err() {
-                            let err = res.err().unwrap();
-                            if err.code() != -536870206 {
-                                let localized_desc = err.localizedDescription();
-                                let localized_failure_reason = err.localizedFailureReason();
-                                panic!("Error: {:?}, {:?}, {:?}", err, localized_desc, localized_failure_reason);
-                            } else {
-                                debug!("Transfer no longer active");
-                                // TODO: unlink
-                                return;
-                            }
-                        }
-
-                        let msg = unsafe { ep.currentTransferMessage().as_ref() };
-
-                        let msg_type = IOUSBHostCIMessageType(
-                            (msg.control & IOUSBHostCIMessageControlType)
-                                >> IOUSBHostCIMessageControlTypePhase,
-                        );
-                        debug!("MSG type: {}", unsafe {
-                            CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
-                        });
-
-                        match msg_type {
-                            IOUSBHostCIMessageType::NormalTransfer => {
-                                if msg.control & IOUSBHostCIMessageControlNoResponse != 0 {
-                                    panic!("Message should need a response");
-                                }
-
-                                if msg.control & IOUSBHostCIMessageControlValid == 0 {
-                                    panic!("Message should be valid");
-                                }
-
-                                let data_length: u32 = (msg.data0 & IOUSBHostCINormalTransferData0Length)
-                                    >> IOUSBHostCINormalTransferData0LengthPhase;
-                                let buffer: &mut [u8] = unsafe {
-                                    from_raw_parts_mut(
-                                        ((msg.data1 & IOUSBHostCINormalTransferData1Buffer)
-                                            >> IOUSBHostCINormalTransferData1BufferPhase)
-                                            as *mut _,
-                                        data_length as usize,
-                                    )
-                                };
-
-                                debug!("Length: {}", data_length);
-                                // debug!("Buffer: {:?}", buffer);
-
-                                let dir = if (endpoint_address & 0x80) != 0 {
-                                    UsbIpDirection::UsbDirIn
-                                } else {
-                                    UsbIpDirection::UsbDirOut
-                                };
-
-                                let client = client;
-                                let ep_ptr = ForceableSend(ep.clone());
-                                let client = ForceableSend(client.0.clone());
-
-                                RUNTIME.spawn(async move {
-                                    let transfer_buffer = if dir == UsbIpDirection::UsbDirIn {
-                                        vec![]
-                                    } else {
-                                        buffer.to_vec()
-                                    };
-                                    let mut client = client;
-                                    let ret = unsafe {
-                                        client
-                                            .0
-                                            .borrow_mut()
-                                            .get()
-                                            .as_mut()
-                                            .unwrap()
-                                            .cmd_submit(
-                                                dir,
-                                                (endpoint_address & 0x0f) as u32,
-                                                0,
-                                                data_length,
-                                                0, // unimplemented
-                                                0, // unimplemented
-                                                200, // depending on usb protocol version, cannot be too high
-                                                [0, 0, 0, 0, 0, 0, 0, 0],
-                                                &transfer_buffer,
-                                                &[] // unimplemented
-                                            )
-                                            .await
-                                    }
-                                    .unwrap();
-                                    run_on_main(move |_| {
-                                        debug!("Submit result: {:?}", ret);
-
-                                        let real_length = min(ret.buffer.len(), data_length as usize);
-                                        if (real_length as u32) != data_length {
-                                            debug!(
-                                                "WARN: Data length mismatch: {} != {}",
-                                                real_length, data_length
-                                            );
-                                        }
-
-                                        if dir == UsbIpDirection::UsbDirIn {
-                                            debug!("Copying data to buffer...");
-                                            buffer[..real_length]
-                                                .copy_from_slice(&ret.buffer[..real_length as usize]);
-                                        } else {
-                                            debug!("Copying data from buffer... NOT IMPLEMENTED");
-                                        }
-
-                                        let ep_ptr = ep_ptr;
-                                        let ep = ep_ptr.0;
-
-                                        let res = unsafe {
-                                            ep.enqueueTransferCompletionForMessage_status_transferLength_error(
-                                                NonNull::from(msg),
-                                                IOUSBHostCIMessageStatus::Success,
-                                                data_length as usize,
-                                            )
-                                        };
-                                        if res.is_err() {
-                                            let err = res.err().unwrap();
-                                            let localized_desc = err.localizedDescription();
-                                            let localized_failure_reason = err.localizedFailureReason();
-                                            panic!("Error: {:?}, {:?}, {:?}", err, localized_desc, localized_failure_reason);
-                                        }
-
-                                        let msg = unsafe { ep.currentTransferMessage().as_ref() };
-
-                                        let msg_type = IOUSBHostCIMessageType(
-                                            (msg.control & IOUSBHostCIMessageControlType)
-                                                >> IOUSBHostCIMessageControlTypePhase,
-                                        );
-                                        debug!("MSG type: {}", unsafe {
-                                            CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
-                                        });
-
-                                        match msg_type {
-                                            IOUSBHostCIMessageType::NormalTransfer => {
-                                                if msg.control & IOUSBHostCIMessageControlNoResponse != 0 {
-                                                    panic!("Message should need a response");
-                                                }
-
-                                                if msg.control & IOUSBHostCIMessageControlValid == 0 {
-                                                    panic!("Message should be valid");
-                                                }
-
-                                                let data_length: u32 = (msg.data0 & IOUSBHostCINormalTransferData0Length)
-                                                    >> IOUSBHostCINormalTransferData0LengthPhase;
-                                                let buffer: &mut [u8] = unsafe {
-                                                    from_raw_parts_mut(
-                                                        ((msg.data1 & IOUSBHostCINormalTransferData1Buffer)
-                                                            >> IOUSBHostCINormalTransferData1BufferPhase)
-                                                            as *mut _,
-                                                        data_length as usize,
-                                                    )
-                                                };
-
-                                                debug!("Length: {}", data_length);
-                                                // debug!("Buffer: {:?}", buffer);
-
-                                                let dir = if (endpoint_address & 0x80) != 0 {
-                                                    UsbIpDirection::UsbDirIn
-                                                } else {
-                                                    UsbIpDirection::UsbDirOut
-                                                };
-
-                                                let client = client;
-                                                let ep_ptr = ForceableSend(ep.clone());
-                                                let client = ForceableSend(client.0.clone());
-
-                                                RUNTIME.spawn(async move {
-                                                    let transfer_buffer = if dir == UsbIpDirection::UsbDirIn {
-                                                        vec![]
-                                                    } else {
-                                                        buffer.to_vec()
-                                                    };
-                                                    let mut client = client;
-                                                    let ret = unsafe {
-                                                        client
-                                                            .0
-                                                            .borrow_mut()
-                                                            .get()
-                                                            .as_mut()
-                                                            .unwrap()
-                                                            .cmd_submit(
-                                                                dir,
-                                                                (endpoint_address & 0x0f) as u32,
-                                                                0,
-                                                                data_length,
-                                                                0, // unimplemented
-                                                                0, // unimplemented
-                                                                200, // depending on usb protocol version, cannot be too high
-                                                                [0, 0, 0, 0, 0, 0, 0, 0],
-                                                                &transfer_buffer,
-                                                                &[] // unimplemented
-                                                            )
-                                                            .await
-                                                    }
-                                                    .unwrap();
-                                                    run_on_main(move |_| {
-                                                        debug!("Submit result: {:?}", ret);
-
-                                                        let real_length = min(ret.buffer.len(), data_length as usize);
-                                                        if (real_length as u32) != data_length {
-                                                            debug!(
-                                                                "WARN: Data length mismatch: {} != {}",
-                                                                real_length, data_length
-                                                            );
-                                                        }
-
-                                                        if dir == UsbIpDirection::UsbDirIn {
-                                                            debug!("Copying data to buffer...");
-                                                            buffer[..real_length]
-                                                                .copy_from_slice(&ret.buffer[..real_length as usize]);
-                                                        } else {
-                                                            debug!("Copying data from buffer... NOT IMPLEMENTED");
-                                                        }
-
-                                                        let ep_ptr = ep_ptr;
-                                                        let ep = ep_ptr.0;
-
-                                                        let res = unsafe {
-                                                            ep.enqueueTransferCompletionForMessage_status_transferLength_error(
-                                                                NonNull::from(msg),
-                                                                IOUSBHostCIMessageStatus::Success,
-                                                                data_length as usize,
-                                                            )
-                                                        };
-                                                        if res.is_err() {
-                                                            let err = res.err().unwrap();
-                                                            let localized_desc = err.localizedDescription();
-                                                            let localized_failure_reason = err.localizedFailureReason();
-                                                            panic!("Error: {:?}, {:?}, {:?}", err, localized_desc, localized_failure_reason);
-                                                        }
-
-                                                        let msg = unsafe { ep.currentTransferMessage().as_ref() };
-
-                                                        let msg_type = IOUSBHostCIMessageType(
-                                                            (msg.control & IOUSBHostCIMessageControlType)
-                                                                >> IOUSBHostCIMessageControlTypePhase,
-                                                        );
-                                                        debug!("MSG type: {}", unsafe {
-                                                            CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
-                                                        });
-
-                                                        match msg_type {
-                                                            IOUSBHostCIMessageType::NormalTransfer => {
-                                                                panic!("Normal transfer not implemented");
-                                                            }
-                                                            IOUSBHostCIMessageType::Link => {
-                                                                if msg.control & IOUSBHostCIMessageControlValid != 0 {
-                                                                    // panic!("Message should be valid");
-                                                                    debug!("Message is valid");
-                                                                    return;
-                                                                }
-
-                                                                if msg.control & IOUSBHostCIMessageControlNoResponse == 0 {
-                                                                    let res = unsafe {
-                                                                        ep.enqueueTransferCompletionForMessage_status_transferLength_error(
-                                                                            NonNull::from(msg),
-                                                                            IOUSBHostCIMessageStatus::Success,
-                                                                            0,
-                                                                        )
-                                                                    };
-                                                                    if res.is_err() {
-                                                                        panic!("Error: {:?}", res.err().unwrap());
-                                                                    }
-
-                                                                    let msg = unsafe { ep.currentTransferMessage().as_ref() };
-
-                                                                    let msg_type = IOUSBHostCIMessageType(
-                                                                        (msg.control & IOUSBHostCIMessageControlType)
-                                                                            >> IOUSBHostCIMessageControlTypePhase,
-                                                                    );
-                                                                    debug!("MSG type: {}", unsafe {
-                                                                        CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
-                                                                    });
-
-                                                                    if msg.control & IOUSBHostCIMessageControlValid != 0 {
-                                                                        debug!("Message is valid");
-                                                                    }
-                                                                }
-                                                            }
-                                                            t => {
-                                                                panic!("Unexpected message type: {:?}", t);
-                                                            }
-                                                        }
-                                                    });
-                                                });
-                                            }
-                                            IOUSBHostCIMessageType::Link => {
-                                                if msg.control & IOUSBHostCIMessageControlValid != 0 {
-                                                    // panic!("Message should be valid");
-                                                    debug!("Message is valid");
-                                                    return;
-                                                }
-
-                                                if msg.control & IOUSBHostCIMessageControlNoResponse == 0 {
-                                                    let res = unsafe {
-                                                        ep.enqueueTransferCompletionForMessage_status_transferLength_error(
-                                                            NonNull::from(msg),
-                                                            IOUSBHostCIMessageStatus::Success,
-                                                            0,
-                                                        )
-                                                    };
-                                                    if res.is_err() {
-                                                        panic!("Error: {:?}", res.err().unwrap());
-                                                    }
-
-                                                    let msg = unsafe { ep.currentTransferMessage().as_ref() };
-
-                                                    let msg_type = IOUSBHostCIMessageType(
-                                                        (msg.control & IOUSBHostCIMessageControlType)
-                                                            >> IOUSBHostCIMessageControlTypePhase,
-                                                    );
-                                                    debug!("MSG type: {}", unsafe {
-                                                        CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
-                                                    });
-
-                                                    if msg.control & IOUSBHostCIMessageControlValid != 0 {
-                                                        debug!("Message is valid");
-                                                    }
-                                                }
-                                            }
-                                            t => {
-                                                panic!("Unexpected message type: {:?}", t);
-                                            }
-                                        }
-                                    });
-                                });
-                            }
-                            IOUSBHostCIMessageType::Link => {
-                                if msg.control & IOUSBHostCIMessageControlValid != 0 {
-                                    // panic!("Message should be valid");
-                                    debug!("Message is valid");
-                                    return;
-                                }
-
-                                if msg.control & IOUSBHostCIMessageControlNoResponse == 0 {
-                                    let res = unsafe {
-                                        ep.enqueueTransferCompletionForMessage_status_transferLength_error(
-                                            NonNull::from(msg),
-                                            IOUSBHostCIMessageStatus::Success,
-                                            0,
-                                        )
-                                    };
-                                    if res.is_err() {
-                                        panic!("Error: {:?}", res.err().unwrap());
-                                    }
-
-                                    let msg = unsafe { ep.currentTransferMessage().as_ref() };
-
-                                    let msg_type = IOUSBHostCIMessageType(
-                                        (msg.control & IOUSBHostCIMessageControlType)
-                                            >> IOUSBHostCIMessageControlTypePhase,
-                                    );
-                                    debug!("MSG type: {}", unsafe {
-                                        CStr::from_ptr(msg_type.to_string()).to_str().unwrap()
-                                    });
-
-                                    if msg.control & IOUSBHostCIMessageControlValid != 0 {
-                                        debug!("Message is valid");
-                                    }
-                                }
-                            }
-                            t => {
-                                panic!("Unexpected message type: {:?}", t);
-                            }
-                        }
-                    });
-                });
+                // Use the recursive helper function to process all normal transfers
+                process_normal_transfers(
+                    ep.clone_state_machine(),
+                    endpoint_address,
+                    Arc::clone(&client),
+                );
             }
             IOUSBHostCIMessageType::Link => {
                 warn!("Link message received"); // not usually expected here
