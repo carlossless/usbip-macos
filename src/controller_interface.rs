@@ -48,8 +48,20 @@ use tokio::runtime::Runtime;
 use crate::{
     device::Device,
     endpoint::Endpoint,
-    usbip::{UsbIpClient, UsbIpDirection},
+    usbip::{UsbIpClient, UsbIpDirection, UsbIpSpeed},
 };
+
+fn usbip_speed_to_host_ci_speed(speed: &UsbIpSpeed) -> IOUSBHostCIDeviceSpeed {
+    match speed {
+        UsbIpSpeed::Unknown => IOUSBHostCIDeviceSpeed::None,
+        UsbIpSpeed::Low => IOUSBHostCIDeviceSpeed::Low,
+        UsbIpSpeed::Full => IOUSBHostCIDeviceSpeed::Full,
+        UsbIpSpeed::High => IOUSBHostCIDeviceSpeed::High,
+        UsbIpSpeed::Wireless => IOUSBHostCIDeviceSpeed::High, // No direct mapping, use High
+        UsbIpSpeed::Super => IOUSBHostCIDeviceSpeed::Super,
+        UsbIpSpeed::SuperPlus => IOUSBHostCIDeviceSpeed::SuperPlus,
+    }
+}
 
 // These constants are not present in objc2-io-usb-host, so we define them here
 // https://github.com/madsmtm/objc2/issues/753
@@ -244,7 +256,7 @@ fn command_handler(
     controller: NonNull<IOUSBHostControllerInterface>,
     command: IOUSBHostCIMessage,
     devices: &mut Vec<Device>,
-    _client: Arc<UnsafeCell<UsbIpClient>>,
+    client: Arc<UnsafeCell<UsbIpClient>>,
 ) {
     debug!("Command handler called with command: {:?}", command);
     let msg_type = IOUSBHostCIMessageType(
@@ -395,10 +407,19 @@ fn command_handler(
                 panic!("Error: {:?}", res.err().unwrap());
             }
 
+            let device_speed = unsafe {
+                client
+                    .get()
+                    .as_ref()
+                    .and_then(|c| c.get_imported_device_speed())
+                    .map(usbip_speed_to_host_ci_speed)
+                    .unwrap_or(IOUSBHostCIDeviceSpeed::Full)
+            };
+
             let res = unsafe {
                 port.updateLinkState_speed_inhibitLinkStateChange_error(
                     IOUSBHostCILinkState::U0,
-                    IOUSBHostCIDeviceSpeed::Full, // TODO: needs to be based on connected device speed
+                    device_speed,
                     false,
                 )
             };

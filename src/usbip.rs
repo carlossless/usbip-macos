@@ -139,6 +139,10 @@ impl Device {
     pub fn get_id_product(&self) -> u16 {
         self.id_product
     }
+
+    pub fn get_speed(&self) -> &UsbIpSpeed {
+        &self.speed
+    }
 }
 
 impl Debug for Device {
@@ -560,6 +564,10 @@ impl UsbIpClient {
         self.imported_device
             .as_ref()
             .ok_or_else(|| anyhow!("Device not imported"))
+    }
+
+    pub fn get_imported_device_speed(&self) -> Option<&UsbIpSpeed> {
+        self.imported_device.as_ref().map(|d| d.get_speed())
     }
 
     async fn send_device_list_request(stream: &mut TcpStream) -> UsbIpResult<()> {
