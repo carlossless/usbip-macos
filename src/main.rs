@@ -91,6 +91,11 @@ fn build_attach_command() -> Command {
                 .conflicts_with("device")
                 .help("The product ID of the device to attach"),
         )
+        .arg(
+            arg!(--"wait-for-enter")
+                .action(clap::ArgAction::SetTrue)
+                .help("Wait for Enter key before plugging in port (for debugging)"),
+        )
 }
 
 fn extract_connection_info(matches: &clap::ArgMatches) -> (&str, u16) {
@@ -124,6 +129,7 @@ struct AttachConfig {
     device: Option<u32>,
     vendor_id: Option<u16>,
     product_id: Option<u16>,
+    wait_for_enter: bool,
 }
 
 fn extract_attach_config(submatches: &clap::ArgMatches) -> AttachConfig {
@@ -132,6 +138,7 @@ fn extract_attach_config(submatches: &clap::ArgMatches) -> AttachConfig {
         device: submatches.get_one::<u32>("device").cloned(),
         vendor_id: submatches.get_one::<u16>("vendor_id").cloned(),
         product_id: submatches.get_one::<u16>("product_id").cloned(),
+        wait_for_enter: submatches.get_flag("wait-for-enter"),
     }
 }
 
@@ -194,6 +201,7 @@ fn attach(addr: &str, config: AttachConfig) -> ! {
     let ci_client = Arc::new(UnsafeCell::new(client));
     let usbip_client_1 = ForceableSend(Arc::clone(&ci_client));
     let usbip_client_2 = ForceableSend(Arc::clone(&ci_client));
+    let wait_for_enter = config.wait_for_enter;
 
     std::thread::spawn(move || {
         let z = usbip_client_1;
@@ -205,10 +213,12 @@ fn attach(addr: &str, config: AttachConfig) -> ! {
                 process::exit(1);
             }
         };
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        print!("Waiting for Enter to continue plugging in port...");
-        io::stdout().flush().unwrap();
-        let _ = io::stdin().read_line(&mut String::new());
+        if wait_for_enter {
+            std::thread::sleep(std::time::Duration::from_secs(1)); // allow initial setup to finish
+            print!("Waiting for Enter to continue plugging in port...");
+            io::stdout().flush().unwrap();
+            let _ = io::stdin().read_line(&mut String::new());
+        }
         let port = unsafe {
             _con_iface
                 ._control_interface
