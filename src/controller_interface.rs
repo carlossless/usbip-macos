@@ -10,7 +10,10 @@ use std::{
     ptr::NonNull,
     rc::Rc,
     slice::from_raw_parts_mut,
-    sync::{Arc, LazyLock},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc, LazyLock,
+    },
 };
 
 use block2::RcBlock;
@@ -127,17 +130,20 @@ fn fnmut_to_fn3<T, U, V>(closure: impl FnMut(T, U, V)) -> impl Fn(T, U, V) {
 }
 
 impl ControllerInterface {
-    pub fn new(usbip_client: Arc<UnsafeCell<UsbIpClient>>) -> Result<Self, Error> {
+    pub fn new(usbip_client: Arc<UnsafeCell<UsbIpClient>>) -> Result<(Self, Receiver<()>), Error> {
         let mut capabilities = Self::create_controller_capabilities();
         let mut port_capabilities = Self::create_port_capabilities();
 
         let devices = Rc::new(RefCell::new(Vec::new()));
 
+        // Create channel to signal when port is ready for connection
+        let (ready_tx, ready_rx) = mpsc::channel();
+
         let (devices_cmd, devices_db) = (Rc::clone(&devices), Rc::clone(&devices));
         let (usbip_client_cmd, usbip_client_db) =
             (Arc::clone(&usbip_client), Arc::clone(&usbip_client));
 
-        let command_block = Self::create_command_block(devices_cmd, usbip_client_cmd);
+        let command_block = Self::create_command_block(devices_cmd, usbip_client_cmd, ready_tx);
         let doorbell_block = Self::create_doorbell_block(devices_db, usbip_client_db);
 
         let capabilities_data =
@@ -146,10 +152,13 @@ impl ControllerInterface {
         let interface =
             Self::create_controller_interface(&capabilities_data, &command_block, &doorbell_block)?;
 
-        Ok(Self {
-            _control_interface: interface,
-            _devices: devices,
-        })
+        Ok((
+            Self {
+                _control_interface: interface,
+                _devices: devices,
+            },
+            ready_rx,
+        ))
     }
 
     fn create_controller_capabilities() -> IOUSBHostCIMessage {
@@ -184,10 +193,12 @@ impl ControllerInterface {
     fn create_command_block(
         devices: Rc<RefCell<Vec<Device>>>,
         usbip_client: Arc<UnsafeCell<UsbIpClient>>,
+        ready_tx: Sender<()>,
     ) -> RcBlock<dyn Fn(NonNull<IOUSBHostControllerInterface>, IOUSBHostCIMessage)> {
+        let ready_tx = Arc::new(std::sync::Mutex::new(Some(ready_tx)));
         RcBlock::new(fnmut_to_fn2(move |a, b| {
             let dev: &mut Vec<Device> = unsafe { &mut *devices.as_ptr() };
-            command_handler(a, b, dev, Arc::clone(&usbip_client))
+            command_handler(a, b, dev, Arc::clone(&usbip_client), Arc::clone(&ready_tx))
         }))
     }
 
@@ -259,6 +270,7 @@ fn command_handler(
     command: IOUSBHostCIMessage,
     devices: &mut Vec<Device>,
     client: Arc<UnsafeCell<UsbIpClient>>,
+    ready_tx: Arc<std::sync::Mutex<Option<Sender<()>>>>,
 ) {
     debug!("Command handler called with command: {:?}", command);
     let msg_type = IOUSBHostCIMessageType(
@@ -366,7 +378,13 @@ fn command_handler(
                 panic!("Error: {:?}", res.err().unwrap());
             }
 
-            // unsafe { port.setConnected(true) };
+            // Signal that port is ready for device connection
+            if let Ok(mut guard) = ready_tx.lock() {
+                if let Some(tx) = guard.take() {
+                    let _ = tx.send(());
+                    debug!("Signaled port ready for connection");
+                }
+            }
         }
         IOUSBHostCIMessageType::PortStatus => {
             let res = unsafe {

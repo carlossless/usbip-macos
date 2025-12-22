@@ -206,19 +206,26 @@ fn attach(addr: &str, config: AttachConfig) -> ! {
     std::thread::spawn(move || {
         let z = usbip_client_1;
         let t = z.0;
-        let _con_iface = match ControllerInterface::new(t) {
-            Ok(iface) => iface,
+        let (_con_iface, ready_rx) = match ControllerInterface::new(t) {
+            Ok(result) => result,
             Err(e) => {
                 eprintln!("Error creating controller interface: {}", e);
                 process::exit(1);
             }
         };
+
+        // Wait for port to be powered on and ready
+        if let Err(e) = ready_rx.recv() {
+            eprintln!("Error waiting for port ready signal: {}", e);
+            process::exit(1);
+        }
+
         if wait_for_enter {
-            std::thread::sleep(std::time::Duration::from_secs(1)); // allow initial setup to finish
             print!("Waiting for Enter to continue plugging in port...");
             io::stdout().flush().unwrap();
             let _ = io::stdin().read_line(&mut String::new());
         }
+
         let port = unsafe {
             _con_iface
                 ._control_interface
