@@ -191,12 +191,14 @@ impl UsbIpCommand {
 #[derive(Debug, Clone, Copy)]
 enum UsbIpCmdType {
     CmdSubmit = 0x00000001,
+    CmdUnlink = 0x00000002,
 }
 
 impl UsbIpCmdType {
     fn name(self) -> &'static str {
         match self {
             Self::CmdSubmit => "USBIP_CMD_SUBMIT",
+            Self::CmdUnlink => "USBIP_CMD_UNLINK",
         }
     }
 }
@@ -324,6 +326,34 @@ impl UsbCommandSubmit {
         buf.put(&self.setup_bytes[..]);
         buf.put(&self.transfer_buffer[..]);
         buf.put(&self.iso_packet_descriptor[..]);
+        buf
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UsbCommandUnlink {
+    header: UsbCommandHeader,
+    seqnum_to_unlink: u32,
+}
+
+impl UsbCommandUnlink {
+    pub fn new(header: UsbCommandHeader, seqnum_to_unlink: u32) -> Self {
+        Self {
+            header,
+            seqnum_to_unlink,
+        }
+    }
+
+    pub fn to_bytes(&self) -> BytesMut {
+        let mut buf = BytesMut::with_capacity(USB_COMMAND_HEADER_SIZE + 24);
+        buf.put(&self.header.to_bytes()[..]);
+        buf.put_u32(self.seqnum_to_unlink);
+        // Padding to match USBIP_CMD_UNLINK structure (24 bytes after header)
+        buf.put_u32(0); // padding
+        buf.put_u32(0); // padding
+        buf.put_u32(0); // padding
+        buf.put_u32(0); // padding
+        buf.put_u32(0); // padding
         buf
     }
 }
@@ -519,6 +549,58 @@ impl UsbIpClient {
         Ok(response)
     }
 
+    /// Send an unlink command to cancel a pending transaction
+    pub async fn cmd_unlink(&mut self, seqnum_to_unlink: u32) -> UsbIpResult<()> {
+        self.seqnum = self.seqnum.wrapping_add(1);
+
+        let device = self.get_imported_device()?;
+        let header = UsbCommandHeader::new(
+            UsbIpCmdType::CmdUnlink as u32,
+            self.seqnum,
+            (device.busnum << 16) | device.devnum,
+            0, // direction doesn't matter for unlink
+            0, // endpoint doesn't matter for unlink
+        );
+
+        let cmd = UsbCommandUnlink::new(header, seqnum_to_unlink);
+        let stream = self.get_stream_mut()?;
+        stream.write_all(&cmd.to_bytes()).await?;
+        debug!(
+            "Sent {} request for seqnum {}",
+            UsbIpCmdType::CmdUnlink.name(),
+            seqnum_to_unlink
+        );
+
+        Ok(())
+    }
+
+    /// Unlink all pending transactions - call this before shutdown
+    pub async fn unlink_all_pending(&mut self) -> UsbIpResult<()> {
+        let pending_seqnums: Vec<u32> = {
+            let pending = self.pending.lock().await;
+            pending.keys().copied().collect()
+        };
+
+        if pending_seqnums.is_empty() {
+            debug!("No pending transactions to unlink");
+            return Ok(());
+        }
+
+        debug!(
+            "Unlinking {} pending transactions: {:?}",
+            pending_seqnums.len(),
+            pending_seqnums
+        );
+
+        for seqnum in pending_seqnums {
+            if let Err(e) = self.cmd_unlink(seqnum).await {
+                debug!("Failed to unlink seqnum {}: {}", seqnum, e);
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn poll(&mut self) -> UsbIpResult<()> {
         let stream = match self.stream.as_mut() {
             Some(s) => s,
@@ -535,6 +617,19 @@ impl UsbIpClient {
 
         let header = UsbCommandHeader::from_stream(stream).await?;
         let seqnum = header.seqnum();
+
+        // Handle RET_UNLINK (0x04) separately - just consume the response
+        if header.command == 0x04 {
+            // RET_UNLINK: read status (4 bytes) + padding (24 bytes)
+            let status = stream.read_i32().await?;
+            let mut padding = [0u8; 24];
+            stream.read_exact(&mut padding).await?;
+            debug!(
+                "Received RET_UNLINK for seqnum {}, status: {}",
+                seqnum, status
+            );
+            return Ok(());
+        }
 
         let pending_request = self.pending.lock().await.remove(&seqnum);
 

@@ -7,6 +7,7 @@ use dispatch2::dispatch_main;
 use log::debug;
 use simple_logger::SimpleLogger;
 use std::io::{self, Write};
+use tokio::signal;
 use usbip::UsbIpClient;
 
 mod controller_interface;
@@ -266,6 +267,9 @@ fn spawn_polling_task(
     rt: &tokio::runtime::Runtime,
     usbip_client: ForceableSend<Arc<UnsafeCell<UsbIpClient>>>,
 ) {
+    let client_for_signal = ForceableSend(Arc::clone(&usbip_client.0));
+
+    // Spawn the polling task
     rt.spawn(async move {
         debug!("Controller interface initialized successfully.");
         let cl = usbip_client;
@@ -278,5 +282,39 @@ fn spawn_polling_task(
                 }
             }
         }
+    });
+
+    // Spawn the signal handler task
+    rt.spawn(async move {
+        let cl = client_for_signal;
+
+        let ctrl_c = signal::ctrl_c();
+
+        let terminate = async {
+            signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("Failed to install SIGTERM handler")
+                .recv()
+                .await;
+        };
+
+        tokio::select! {
+            _ = ctrl_c => {
+                debug!("Received SIGINT, shutting down...");
+            }
+            _ = terminate => {
+                debug!("Received SIGTERM, shutting down...");
+            }
+        }
+
+        // Unlink all pending transactions before exiting
+        eprintln!("\nShutting down, unlinking pending transactions...");
+        unsafe {
+            let client_ref = &mut *cl.0.get();
+            if let Err(e) = client_ref.unlink_all_pending().await {
+                eprintln!("Error unlinking pending transactions: {}", e);
+            }
+        }
+
+        process::exit(0);
     });
 }
