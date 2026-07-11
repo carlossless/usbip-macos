@@ -1,7 +1,6 @@
 use core::panic;
 use std::{
-    borrow::BorrowMut,
-    cell::{RefCell, UnsafeCell},
+    cell::RefCell,
     cmp::min,
     ffi::{c_ulong, CStr},
     io::Error,
@@ -33,8 +32,8 @@ use objc2_io_usb_host::{
     IOUSBHostCIDoorbellEndpointAddressPhase, IOUSBHostCIDoorbellStreamID,
     IOUSBHostCIDoorbellStreamIDPhase, IOUSBHostCIEndpointState, IOUSBHostCIEndpointStateMachine,
     IOUSBHostCIIsochronousTransferControlASAP, IOUSBHostCIIsochronousTransferControlFrameNumber,
-    IOUSBHostCIIsochronousTransferControlFrameNumberPhase, IOUSBHostCILinkState, IOUSBHostCIMessage,
-    IOUSBHostCIMessageControlNoResponse, IOUSBHostCIMessageControlStatus,
+    IOUSBHostCIIsochronousTransferControlFrameNumberPhase, IOUSBHostCILinkState,
+    IOUSBHostCIMessage, IOUSBHostCIMessageControlNoResponse, IOUSBHostCIMessageControlStatus,
     IOUSBHostCIMessageControlStatusPhase, IOUSBHostCIMessageControlType,
     IOUSBHostCIMessageControlTypePhase, IOUSBHostCIMessageControlValid, IOUSBHostCIMessageStatus,
     IOUSBHostCIMessageType, IOUSBHostCINormalTransferData0Length,
@@ -49,11 +48,12 @@ use objc2_io_usb_host::{
     IOUSBHostCISetupTransferData1wValuePhase, IOUSBHostControllerInterface,
 };
 use tokio::runtime::Runtime;
+use tokio::sync::Mutex as TokioMutex;
 
 use crate::{
     device::Device,
     endpoint::Endpoint,
-    usbip::{UsbIpClient, UsbIpDirection, UsbIpSpeed},
+    usbip::{UsbIpDirection, UsbIpSpeed, UsbIpWriter},
 };
 
 fn usbip_speed_to_host_ci_speed(speed: &UsbIpSpeed) -> IOUSBHostCIDeviceSpeed {
@@ -130,7 +130,10 @@ fn fnmut_to_fn3<T, U, V>(closure: impl FnMut(T, U, V)) -> impl Fn(T, U, V) {
 }
 
 impl ControllerInterface {
-    pub fn new(usbip_client: Arc<UnsafeCell<UsbIpClient>>) -> Result<(Self, Receiver<()>), Error> {
+    pub fn new(
+        writer: Arc<TokioMutex<UsbIpWriter>>,
+        device_speed: UsbIpSpeed,
+    ) -> Result<(Self, Receiver<()>), Error> {
         let mut capabilities = Self::create_controller_capabilities();
         let mut port_capabilities = Self::create_port_capabilities();
 
@@ -140,11 +143,10 @@ impl ControllerInterface {
         let (ready_tx, ready_rx) = mpsc::channel();
 
         let (devices_cmd, devices_db) = (Rc::clone(&devices), Rc::clone(&devices));
-        let (usbip_client_cmd, usbip_client_db) =
-            (Arc::clone(&usbip_client), Arc::clone(&usbip_client));
+        let ci_device_speed = usbip_speed_to_host_ci_speed(&device_speed);
 
-        let command_block = Self::create_command_block(devices_cmd, usbip_client_cmd, ready_tx);
-        let doorbell_block = Self::create_doorbell_block(devices_db, usbip_client_db);
+        let command_block = Self::create_command_block(devices_cmd, ci_device_speed, ready_tx);
+        let doorbell_block = Self::create_doorbell_block(devices_db, writer);
 
         let capabilities_data =
             Self::create_capabilities_data(&mut capabilities, &mut port_capabilities)?;
@@ -192,23 +194,23 @@ impl ControllerInterface {
 
     fn create_command_block(
         devices: Rc<RefCell<Vec<Device>>>,
-        usbip_client: Arc<UnsafeCell<UsbIpClient>>,
+        device_speed: IOUSBHostCIDeviceSpeed,
         ready_tx: Sender<()>,
     ) -> RcBlock<dyn Fn(NonNull<IOUSBHostControllerInterface>, IOUSBHostCIMessage)> {
         let ready_tx = Arc::new(std::sync::Mutex::new(Some(ready_tx)));
         RcBlock::new(fnmut_to_fn2(move |a, b| {
             let dev: &mut Vec<Device> = unsafe { &mut *devices.as_ptr() };
-            command_handler(a, b, dev, Arc::clone(&usbip_client), Arc::clone(&ready_tx))
+            command_handler(a, b, dev, device_speed, Arc::clone(&ready_tx))
         }))
     }
 
     fn create_doorbell_block(
         devices: Rc<RefCell<Vec<Device>>>,
-        usbip_client: Arc<UnsafeCell<UsbIpClient>>,
+        writer: Arc<TokioMutex<UsbIpWriter>>,
     ) -> RcBlock<CommandHandlerArgs> {
         RcBlock::new(fnmut_to_fn3(move |a, b, c| {
             let dev: &mut Vec<Device> = unsafe { &mut *devices.as_ptr() };
-            doorbell_handler(a, b, c, dev, Arc::clone(&usbip_client))
+            doorbell_handler(a, b, c, dev, Arc::clone(&writer))
         }))
     }
 
@@ -269,7 +271,7 @@ fn command_handler(
     controller: NonNull<IOUSBHostControllerInterface>,
     command: IOUSBHostCIMessage,
     devices: &mut Vec<Device>,
-    client: Arc<UnsafeCell<UsbIpClient>>,
+    device_speed: IOUSBHostCIDeviceSpeed,
     ready_tx: Arc<std::sync::Mutex<Option<Sender<()>>>>,
 ) {
     debug!("Command handler called with command: {:?}", command);
@@ -426,15 +428,6 @@ fn command_handler(
             if res.is_err() {
                 panic!("Error: {:?}", res.err().unwrap());
             }
-
-            let device_speed = unsafe {
-                client
-                    .get()
-                    .as_ref()
-                    .and_then(|c| c.get_imported_device_speed())
-                    .map(usbip_speed_to_host_ci_speed)
-                    .unwrap_or(IOUSBHostCIDeviceSpeed::Full)
-            };
 
             let res = unsafe {
                 port.updateLinkState_speed_inhibitLinkStateChange_error(
@@ -698,7 +691,7 @@ fn command_handler(
 fn process_normal_transfers(
     ep: Retained<IOUSBHostCIEndpointStateMachine>,
     endpoint_address: u8,
-    client: Arc<UnsafeCell<UsbIpClient>>,
+    writer: Arc<TokioMutex<UsbIpWriter>>,
 ) {
     let msg = unsafe { ep.currentTransferMessage().as_ref() };
 
@@ -762,12 +755,10 @@ fn process_normal_transfers(
     };
 
     let ep_send = ForceableSend(ep.clone());
-    let client_send = ForceableSend(client.clone());
 
-    // Convert to raw pointers, then to usize to bypass Send requirement
+    // Convert to raw pointer to bypass Send requirement for ObjC objects
     // SAFETY: We ensure single-threaded access via run_on_main
     let ep_ptr = Box::into_raw(Box::new(ep_send)) as usize;
-    let client_ptr = Box::into_raw(Box::new(client_send)) as usize;
 
     RUNTIME.spawn(async move {
         let transfer_buffer = if dir == UsbIpDirection::UsbDirIn {
@@ -776,34 +767,24 @@ fn process_normal_transfers(
             buffer.to_vec()
         };
 
-        // SAFETY: We own these pointers and they're valid
-        let mut client_send = ForceableSend(unsafe {
-            (*(client_ptr as *mut ForceableSend<Arc<UnsafeCell<UsbIpClient>>>))
-                .0
-                .clone()
-        });
-        let ret = unsafe {
-            client_send
-                .0
-                .borrow_mut()
-                .get()
-                .as_mut()
-                .unwrap()
-                .cmd_submit(
-                    dir,
-                    (endpoint_address & 0x0f) as u32,
-                    0,
-                    data_length,
-                    0,
-                    0,
-                    10, // depending on usb protocol version, cannot be too high
-                    [0, 0, 0, 0, 0, 0, 0, 0],
-                    &transfer_buffer,
-                    &[],
-                )
-                .await
-        }
-        .unwrap();
+        let rx = {
+            let mut w = writer.lock().await;
+            w.send_submit(
+                dir,
+                (endpoint_address & 0x0f) as u32,
+                0,
+                data_length,
+                0,
+                0,
+                10, // depending on usb protocol version, cannot be too high
+                [0, 0, 0, 0, 0, 0, 0, 0],
+                &transfer_buffer,
+                &[],
+            )
+            .await
+            .unwrap()
+        };
+        let ret = rx.await.unwrap();
 
         run_on_main(move |_| {
             debug!("Submit result: {:?}", ret);
@@ -821,14 +802,11 @@ fn process_normal_transfers(
                 buffer[..real_length].copy_from_slice(&ret.buffer[..real_length]);
             }
 
-            // SAFETY: We own these pointers, reconstruct the boxes to use and drop them
+            // SAFETY: We own this pointer, reconstruct the box to use and drop it
             let ep_box = unsafe {
                 Box::from_raw(
                     ep_ptr as *mut ForceableSend<Retained<IOUSBHostCIEndpointStateMachine>>,
                 )
-            };
-            let client_box = unsafe {
-                Box::from_raw(client_ptr as *mut ForceableSend<Arc<UnsafeCell<UsbIpClient>>>)
             };
 
             let res = unsafe {
@@ -852,12 +830,11 @@ fn process_normal_transfers(
                     );
                 } else {
                     debug!("Transfer no longer active");
-                    // return;
                 }
             }
 
             // Recursively process the next transfer (we're on main thread now)
-            process_normal_transfers(ep_box.0, endpoint_address, client_box.0);
+            process_normal_transfers(ep_box.0, endpoint_address, writer);
         });
     });
 }
@@ -867,7 +844,7 @@ fn process_normal_transfers(
 fn process_isochronous_transfers(
     ep: Retained<IOUSBHostCIEndpointStateMachine>,
     endpoint_address: u8,
-    client: Arc<UnsafeCell<UsbIpClient>>,
+    writer: Arc<TokioMutex<UsbIpWriter>>,
 ) {
     let msg = unsafe { ep.currentTransferMessage().as_ref() };
 
@@ -940,12 +917,10 @@ fn process_isochronous_transfers(
     };
 
     let ep_send = ForceableSend(ep.clone());
-    let client_send = ForceableSend(client.clone());
 
-    // Convert to raw pointers, then to usize to bypass Send requirement
+    // Convert to raw pointer to bypass Send requirement for ObjC objects
     // SAFETY: We ensure single-threaded access via run_on_main
     let ep_ptr = Box::into_raw(Box::new(ep_send)) as usize;
-    let client_ptr = Box::into_raw(Box::new(client_send)) as usize;
 
     // Use frame_number as start_frame if not ASAP, otherwise use 0 (current frame)
     let start_frame = if asap { 0 } else { frame_number };
@@ -957,37 +932,26 @@ fn process_isochronous_transfers(
             buffer.to_vec()
         };
 
-        // SAFETY: We own these pointers and they're valid
-        let mut client_send = ForceableSend(unsafe {
-            (*(client_ptr as *mut ForceableSend<Arc<UnsafeCell<UsbIpClient>>>))
-                .0
-                .clone()
-        });
-
         // For isochronous transfers, we use number_of_packets = 1 for single-frame transfers
         // The iso_packet_descriptor would contain per-packet offset/length info for multi-packet
-        let ret = unsafe {
-            client_send
-                .0
-                .borrow_mut()
-                .get()
-                .as_mut()
-                .unwrap()
-                .cmd_submit(
-                    dir,
-                    (endpoint_address & 0x0f) as u32,
-                    0,                   // transfer_flags
-                    data_length,         // transfer_buffer_length
-                    start_frame,         // start_frame for isochronous
-                    1,                   // number_of_packets (single packet per transfer message)
-                    0,                   // interval
-                    [0, 0, 0, 0, 0, 0, 0, 0], // setup_bytes (not used for iso)
-                    &transfer_buffer,
-                    &[],                 // iso_packet_descriptor (handled by USBIP server)
-                )
-                .await
-        }
-        .unwrap();
+        let rx = {
+            let mut w = writer.lock().await;
+            w.send_submit(
+                dir,
+                (endpoint_address & 0x0f) as u32,
+                0,                        // transfer_flags
+                data_length,              // transfer_buffer_length
+                start_frame,              // start_frame for isochronous
+                1,                        // number_of_packets (single packet per transfer message)
+                0,                        // interval
+                [0, 0, 0, 0, 0, 0, 0, 0], // setup_bytes (not used for iso)
+                &transfer_buffer,
+                &[], // iso_packet_descriptor (handled by USBIP server)
+            )
+            .await
+            .unwrap()
+        };
+        let ret = rx.await.unwrap();
 
         run_on_main(move |_| {
             debug!("Isochronous submit result: {:?}", ret);
@@ -1005,14 +969,11 @@ fn process_isochronous_transfers(
                 buffer[..real_length].copy_from_slice(&ret.buffer[..real_length]);
             }
 
-            // SAFETY: We own these pointers, reconstruct the boxes to use and drop them
+            // SAFETY: We own this pointer, reconstruct the box to use and drop it
             let ep_box = unsafe {
                 Box::from_raw(
                     ep_ptr as *mut ForceableSend<Retained<IOUSBHostCIEndpointStateMachine>>,
                 )
-            };
-            let client_box = unsafe {
-                Box::from_raw(client_ptr as *mut ForceableSend<Arc<UnsafeCell<UsbIpClient>>>)
             };
 
             let res = unsafe {
@@ -1040,7 +1001,7 @@ fn process_isochronous_transfers(
             }
 
             // Recursively process the next transfer (we're on main thread now)
-            process_isochronous_transfers(ep_box.0, endpoint_address, client_box.0);
+            process_isochronous_transfers(ep_box.0, endpoint_address, writer);
         });
     });
 }
@@ -1050,7 +1011,7 @@ fn doorbell_handler(
     doorbell_array: NonNull<IOUSBHostCIDoorbell>,
     doorbell_count: u32,
     devices: &mut [Device],
-    client: Arc<UnsafeCell<UsbIpClient>>,
+    writer: Arc<TokioMutex<UsbIpWriter>>,
 ) {
     debug!(
         "Doorbell handler called with doorbell: {:?}",
@@ -1145,7 +1106,7 @@ fn doorbell_handler(
 
                 debug!("Setup Transfer: requestType: {:02x}, request: {:02x}, value: {:02x}, index: {:02x}, length: {:02x}", request_type, request, value, index, length);
 
-                let mut cl = Arc::clone(&client);
+                let writer_clone = Arc::clone(&writer);
 
                 let ep = &ep.clone_state_machine();
 
@@ -1205,30 +1166,27 @@ fn doorbell_handler(
                         UsbIpDirection::UsbDirOut => buffer.to_vec(),
                     };
 
-                    let ret = RUNTIME
-                        .block_on(async {
-                            debug!("Submitting setup transfer...");
-                            unsafe {
-                                cl.borrow_mut()
-                                    .get()
-                                    .as_mut()
-                                    .unwrap()
-                                    .cmd_submit(
-                                        dir,
-                                        (endpoint_address & 0x0f) as u32,
-                                        0,
-                                        length as u32,
-                                        0,
-                                        0,
-                                        0,
-                                        setup_bytes.to_le_bytes(),
-                                        &transfer_buffer,
-                                        &[],
-                                    )
-                                    .await
-                            }
-                        })
-                        .unwrap();
+                    let ret = RUNTIME.block_on(async {
+                        debug!("Submitting setup transfer...");
+                        let rx = {
+                            let mut w = writer_clone.lock().await;
+                            w.send_submit(
+                                dir,
+                                (endpoint_address & 0x0f) as u32,
+                                0,
+                                length as u32,
+                                0,
+                                0,
+                                0,
+                                setup_bytes.to_le_bytes(),
+                                &transfer_buffer,
+                                &[],
+                            )
+                            .await
+                            .unwrap()
+                        };
+                        rx.await.unwrap()
+                    });
 
                     debug!("Submit result: {:?}", ret);
 
@@ -1263,30 +1221,27 @@ fn doorbell_handler(
                         UsbIpDirection::UsbDirOut
                     };
 
-                    let ret = RUNTIME
-                        .block_on(async {
-                            debug!("Submitting setup transfer...");
-                            unsafe {
-                                cl.borrow_mut()
-                                    .get()
-                                    .as_mut()
-                                    .unwrap()
-                                    .cmd_submit(
-                                        dir,
-                                        (endpoint_address & 0x0f) as u32,
-                                        0,
-                                        length as u32,
-                                        0,
-                                        0,
-                                        0,
-                                        setup_bytes.to_le_bytes(),
-                                        &[],
-                                        &[],
-                                    )
-                                    .await
-                            }
-                        })
-                        .unwrap();
+                    let ret = RUNTIME.block_on(async {
+                        debug!("Submitting setup transfer...");
+                        let rx = {
+                            let mut w = writer_clone.lock().await;
+                            w.send_submit(
+                                dir,
+                                (endpoint_address & 0x0f) as u32,
+                                0,
+                                length as u32,
+                                0,
+                                0,
+                                0,
+                                setup_bytes.to_le_bytes(),
+                                &[],
+                                &[],
+                            )
+                            .await
+                            .unwrap()
+                        };
+                        rx.await.unwrap()
+                    });
 
                     debug!("Submit result: {:?}", ret);
                 }
@@ -1355,7 +1310,7 @@ fn doorbell_handler(
                 process_normal_transfers(
                     ep.clone_state_machine(),
                     endpoint_address,
-                    Arc::clone(&client),
+                    Arc::clone(&writer),
                 );
             }
             IOUSBHostCIMessageType::IsochronousTransfer => {
@@ -1373,7 +1328,7 @@ fn doorbell_handler(
                 process_isochronous_transfers(
                     ep.clone_state_machine(),
                     endpoint_address,
-                    Arc::clone(&client),
+                    Arc::clone(&writer),
                 );
             }
             IOUSBHostCIMessageType::Link => {

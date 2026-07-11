@@ -1,14 +1,15 @@
-use std::{cell::UnsafeCell, process, sync::Arc};
+use std::{process, sync::Arc};
 
 use clap::{arg, Command};
 use clap_num::maybe_hex;
-use controller_interface::{ControllerInterface, ForceableSend};
+use controller_interface::ControllerInterface;
 use dispatch2::dispatch_main;
 use log::debug;
 use simple_logger::SimpleLogger;
 use std::io::{self, Write};
 use tokio::signal;
-use usbip::UsbIpClient;
+use tokio::sync::Mutex;
+use usbip::{UsbIpClient, UsbIpReader, UsbIpWriter};
 
 mod controller_interface;
 mod device;
@@ -199,15 +200,25 @@ fn attach(addr: &str, config: AttachConfig) -> ! {
         process::exit(1);
     }
 
-    let ci_client = Arc::new(UnsafeCell::new(client));
-    let usbip_client_1 = ForceableSend(Arc::clone(&ci_client));
-    let usbip_client_2 = ForceableSend(Arc::clone(&ci_client));
+    let device_speed = client
+        .get_imported_device_speed()
+        .copied()
+        .expect("Device speed should be available after import");
+
+    let (writer, reader) = match client.split() {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("Error splitting client: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let writer = Arc::new(Mutex::new(writer));
+    let writer_for_ci = Arc::clone(&writer);
     let wait_for_enter = config.wait_for_enter;
 
     std::thread::spawn(move || {
-        let z = usbip_client_1;
-        let t = z.0;
-        let (_con_iface, ready_rx) = match ControllerInterface::new(t) {
+        let (_con_iface, ready_rx) = match ControllerInterface::new(writer_for_ci, device_speed) {
             Ok(result) => result,
             Err(e) => {
                 eprintln!("Error creating controller interface: {}", e);
@@ -236,7 +247,7 @@ fn attach(addr: &str, config: AttachConfig) -> ! {
         unsafe { port.setConnected(true) };
     });
 
-    spawn_polling_task(&rt, usbip_client_2);
+    spawn_polling_task(&rt, reader, Arc::clone(&writer));
     dispatch_main()
 }
 
@@ -265,29 +276,22 @@ fn find_target_device<'a>(
 
 fn spawn_polling_task(
     rt: &tokio::runtime::Runtime,
-    usbip_client: ForceableSend<Arc<UnsafeCell<UsbIpClient>>>,
+    mut reader: UsbIpReader,
+    writer: Arc<Mutex<UsbIpWriter>>,
 ) {
-    let client_for_signal = ForceableSend(Arc::clone(&usbip_client.0));
-
     // Spawn the polling task
     rt.spawn(async move {
         debug!("Controller interface initialized successfully.");
-        let cl = usbip_client;
         loop {
-            unsafe {
-                let client_ref = &mut *cl.0.get();
-                if let Err(error) = client_ref.poll().await {
-                    eprintln!("Error polling USB/IP client: {}", error);
-                    process::exit(1);
-                }
+            if let Err(error) = reader.poll().await {
+                eprintln!("Error polling USB/IP client: {}", error);
+                process::exit(1);
             }
         }
     });
 
     // Spawn the signal handler task
     rt.spawn(async move {
-        let cl = client_for_signal;
-
         let ctrl_c = signal::ctrl_c();
 
         let terminate = async {
@@ -308,11 +312,9 @@ fn spawn_polling_task(
 
         // Unlink all pending transactions before exiting
         eprintln!("\nShutting down, unlinking pending transactions...");
-        unsafe {
-            let client_ref = &mut *cl.0.get();
-            if let Err(e) = client_ref.unlink_all_pending().await {
-                eprintln!("Error unlinking pending transactions: {}", e);
-            }
+        let mut w = writer.lock().await;
+        if let Err(e) = w.unlink_all_pending().await {
+            eprintln!("Error unlinking pending transactions: {}", e);
         }
 
         process::exit(0);
