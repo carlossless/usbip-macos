@@ -26,10 +26,9 @@
           src = craneLib.cleanCargoSource ./.;
           strictDeps = true;
 
-          buildInputs =
-            [
-              pkgs.apple-sdk
-            ];
+          buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+            pkgs.apple-sdk
+          ];
         };
 
         usbip-macos = craneLib.buildPackage (
