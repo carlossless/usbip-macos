@@ -517,7 +517,9 @@ async fn serve_urbs(stream: TcpStream, export: Export, log: &Arc<Log>) {
                     break;
                 }
                 urb.iso = iso
-                    .chunks_exact(16)
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
                     .map(|c| IsoDesc {
                         offset: be32(c, 0),
                         length: be32(c, 1),

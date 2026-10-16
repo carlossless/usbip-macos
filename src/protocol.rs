@@ -225,7 +225,9 @@ pub async fn read_devlist_reply<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<E
         let mut raw = vec![0u8; device.num_interfaces as usize * INTERFACE_SIZE];
         r.read_exact(&mut raw).await?;
         device.interfaces = raw
-            .chunks_exact(INTERFACE_SIZE)
+            .as_chunks::<INTERFACE_SIZE>()
+            .0
+            .iter()
             .map(|c| Interface {
                 class: c[0],
                 subclass: c[1],
@@ -437,8 +439,10 @@ pub async fn read_submit_payload<R: AsyncRead + Unpin>(
         let mut raw = vec![0u8; number_of_packets as usize * ISO_DESCRIPTOR_SIZE];
         r.read_exact(&mut raw).await?;
         iso_packets.extend(
-            raw.chunks_exact(ISO_DESCRIPTOR_SIZE)
-                .map(IsoPacketDescriptor::decode),
+            raw.as_chunks::<ISO_DESCRIPTOR_SIZE>()
+                .0
+                .iter()
+                .map(|c| IsoPacketDescriptor::decode(c)),
         );
     }
     Ok(RetSubmit {
