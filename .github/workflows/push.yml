@@ -48,7 +48,7 @@ jobs:
             ./target
           key: test-cargo-registry
       - name: Run tests
-        run: cargo test --bins --verbose
+        run: cargo test --verbose
 
   build:
     needs: test

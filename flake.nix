@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     utils.url = "github:numtide/flake-utils";
     crane.url = "github:ipetkov/crane";
     rust-overlay.url = "github:oxalica/rust-overlay";
@@ -19,12 +19,16 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain (fenix.packages.${system}.fromToolchainFile {
           file = ./rust-toolchain.toml;
-          sha256 = "sha256-+9FmLhAOezBZCOziO0Qct1NOrfpjNsXxc/8I0c7BdKE=";
+          sha256 = "sha256-+xUr6Al1wZSqX8aEsq7DpuFOK4Ve/i+qTl+K5uWQ9GM=";
         });
 
         commonArgs = {
           src = craneLib.cleanCargoSource ./.;
           strictDeps = true;
+
+          # .cargo/config.toml runs tests through sudo on macOS, which the build sandbox lacks.
+          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER = "env";
+          CARGO_TARGET_X86_64_APPLE_DARWIN_RUNNER = "env";
 
           buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
             pkgs.apple-sdk
