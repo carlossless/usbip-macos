@@ -1,320 +1,146 @@
-use std::{cell::UnsafeCell, process, sync::Arc};
+use std::process::ExitCode;
 
-use clap::{arg, Command};
-use clap_num::maybe_hex;
-use controller_interface::{ControllerInterface, ForceableSend};
-use dispatch2::dispatch_main;
-use log::debug;
+use anyhow::{anyhow, Context, Result};
 use simple_logger::SimpleLogger;
-use std::io::{self, Write};
-use tokio::signal;
-use usbip::UsbIpClient;
+use tokio::net::TcpStream;
+use usbip_macos::{
+    cli::{self, Action, Selector},
+    client,
+};
 
-mod controller_interface;
-mod device;
-mod endpoint;
-mod usbip;
-
-fn main() {
+fn main() -> ExitCode {
     init_logger();
-    let matches = build_cli().get_matches();
-    let (host, port) = extract_connection_info(&matches);
-    let addr = format!("{host}:{port}");
-    handle_subcommands(&matches, &addr);
+    let args = cli::parse(&cli::command().get_matches());
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: failed to start runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = match args.action {
+        Action::List => runtime.block_on(list(&args.address)),
+        Action::Attach {
+            selector,
+            wait_for_enter,
+        } => attach(&runtime, &args.address, &selector, wait_for_enter),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn init_logger() {
-    #[cfg(debug_assertions)]
-    let default_log_level = log::LevelFilter::Debug;
-    #[cfg(not(debug_assertions))]
-    let default_log_level = log::LevelFilter::Off;
-
-    SimpleLogger::new()
+    let default_level = if cfg!(debug_assertions) {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Warn
+    };
+    let _ = SimpleLogger::new()
         .with_utc_timestamps()
-        .with_level(default_log_level)
+        .with_level(default_level)
         .env()
-        .init()
-        .unwrap();
+        .init();
 }
 
-fn build_cli() -> Command {
-    Command::new("usbip-macos")
-        .about("USBIP client for macOS systems")
-        .version(env!("CARGO_PKG_VERSION"))
-        .arg_required_else_help(true)
-        .author("Karolis Stasaitis")
-        .subcommand(build_attach_command())
-        .subcommand(Command::new("list"))
-        .arg(
-            arg!(-r --remote <HOST>)
-                .value_parser(clap::value_parser!(String))
-                .required(true)
-                .help("The host to connect to"),
-        )
-        .arg(
-            arg!(-p --"tcp-port" <PORT>)
-                .value_parser(clap::value_parser!(u16))
-                .default_value("3240")
-                .help("The port to connect to"),
-        )
+async fn connect(address: &str) -> Result<TcpStream> {
+    let stream = TcpStream::connect(address)
+        .await
+        .with_context(|| format!("connecting to {address}"))?;
+    stream.set_nodelay(true)?;
+    Ok(stream)
 }
 
-fn build_attach_command() -> Command {
-    Command::new("attach")
-        .arg(
-            arg!(--busid <BUSID>)
-                .value_parser(clap::value_parser!(String))
-                .required_unless_present_all(["vendor_id", "product_id"])
-                .conflicts_with_all(["vendor_id", "product_id", "device"])
-                .help("The device to attach (busid)"),
-        )
-        .arg(
-            arg!(--device <DEVICE>)
-                .value_parser(clap::value_parser!(u32))
-                .required_unless_present_all(["vendor_id", "product_id"])
-                .conflicts_with_all(["vendor_id", "product_id", "busid"])
-                .conflicts_with("busid")
-                .help("id of the virtual UDC"),
-        )
-        .arg(
-            arg!(--vendor_id <VENDOR_ID>)
-                .value_parser(maybe_hex::<u16>)
-                .required_unless_present("busid")
-                .conflicts_with("busid")
-                .conflicts_with("device")
-                .help("The vendor ID of the device to attach"),
-        )
-        .arg(
-            arg!(--product_id <PRODUCT_ID>)
-                .value_parser(maybe_hex::<u16>)
-                .required_unless_present("busid")
-                .conflicts_with("busid")
-                .conflicts_with("device")
-                .help("The product ID of the device to attach"),
-        )
-        .arg(
-            arg!(--"wait-for-enter")
-                .action(clap::ArgAction::SetTrue)
-                .help("Wait for Enter key before plugging in port (for debugging)"),
-        )
-}
-
-fn extract_connection_info(matches: &clap::ArgMatches) -> (&str, u16) {
-    let host = matches.get_one::<String>("remote").unwrap();
-    let port = *matches.get_one::<u16>("tcp-port").unwrap();
-    (host, port)
-}
-
-fn handle_subcommands(matches: &clap::ArgMatches, addr: &str) {
-    match matches.subcommand() {
-        Some(("attach", submatches)) => {
-            let attach_config = extract_attach_config(submatches);
-            attach(addr, attach_config);
-        }
-        Some(("list", _)) => {
-            if let Err(e) = list(addr) {
-                eprintln!("Error listing devices: {}", e);
-                process::exit(1);
-            }
-        }
-        _ => {
-            eprintln!("Unknown command or no command provided");
-            process::exit(1);
+async fn list(address: &str) -> Result<()> {
+    let devices = client::list_devices(&mut connect(address).await?).await?;
+    for d in devices {
+        println!(
+            "{}: {:04x}:{:04x} (bus {} dev {}, {:?} speed) {}",
+            d.busid, d.id_vendor, d.id_product, d.busnum, d.devnum, d.speed, d.path
+        );
+        for (i, iface) in d.interfaces.iter().enumerate() {
+            println!(
+                "    {i}: class {:02x} subclass {:02x} protocol {:02x}",
+                iface.class, iface.subclass, iface.protocol
+            );
         }
     }
-}
-
-#[derive(Debug)]
-struct AttachConfig {
-    busid: Option<String>,
-    device: Option<u32>,
-    vendor_id: Option<u16>,
-    product_id: Option<u16>,
-    wait_for_enter: bool,
-}
-
-fn extract_attach_config(submatches: &clap::ArgMatches) -> AttachConfig {
-    AttachConfig {
-        busid: submatches.get_one::<String>("busid").cloned(),
-        device: submatches.get_one::<u32>("device").cloned(),
-        vendor_id: submatches.get_one::<u16>("vendor_id").cloned(),
-        product_id: submatches.get_one::<u16>("product_id").cloned(),
-        wait_for_enter: submatches.get_flag("wait-for-enter"),
-    }
-}
-
-fn list(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let rt = create_runtime()?;
-    let mut client = UsbIpClient::new();
-
-    rt.block_on(client.connect(addr))?;
-    let devices = rt.block_on(client.list_devices())?;
-
-    for device in devices {
-        println!("Device: {:?}", device);
-    }
-
     Ok(())
 }
 
-fn attach(addr: &str, config: AttachConfig) -> ! {
-    let rt = match create_runtime() {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("Error creating runtime: {}", e);
-            process::exit(1);
-        }
-    };
-
-    let mut client = UsbIpClient::new();
-
-    if let Err(e) = rt.block_on(client.connect(addr)) {
-        eprintln!("Error connecting to server: {}", e);
-        process::exit(1);
-    }
-
-    let devices = match rt.block_on(client.list_devices()) {
-        Ok(devices) => devices,
-        Err(e) => {
-            eprintln!("Error listing devices: {}", e);
-            process::exit(1);
-        }
-    };
-
-    let device = match find_target_device(&devices, &config) {
-        Some(device) => device,
-        None => {
-            eprintln!("Device not found");
-            process::exit(1);
-        }
-    };
-
-    if let Err(e) = rt.block_on(client.connect(addr)) {
-        eprintln!("Error reconnecting to server: {}", e);
-        process::exit(1);
-    }
-
-    if let Err(e) = rt.block_on(client.import_device(*device.get_busid())) {
-        eprintln!("Error importing device: {}", e);
-        process::exit(1);
-    }
-
-    let ci_client = Arc::new(UnsafeCell::new(client));
-    let usbip_client_1 = ForceableSend(Arc::clone(&ci_client));
-    let usbip_client_2 = ForceableSend(Arc::clone(&ci_client));
-    let wait_for_enter = config.wait_for_enter;
-
-    std::thread::spawn(move || {
-        let z = usbip_client_1;
-        let t = z.0;
-        let (_con_iface, ready_rx) = match ControllerInterface::new(t) {
-            Ok(result) => result,
-            Err(e) => {
-                eprintln!("Error creating controller interface: {}", e);
-                process::exit(1);
-            }
-        };
-
-        // Wait for port to be powered on and ready
-        if let Err(e) = ready_rx.recv() {
-            eprintln!("Error waiting for port ready signal: {}", e);
-            process::exit(1);
-        }
-
-        if wait_for_enter {
-            print!("Waiting for Enter to continue plugging in port...");
-            io::stdout().flush().unwrap();
-            let _ = io::stdin().read_line(&mut String::new());
-        }
-
-        let port = unsafe {
-            _con_iface
-                ._control_interface
-                .getPortStateMachineForPort_error(1)
-                .unwrap()
-        };
-        unsafe { port.setConnected(true) };
-    });
-
-    spawn_polling_task(&rt, usbip_client_2);
-    dispatch_main()
+#[cfg(target_os = "macos")]
+async fn import(address: &str, selector: &Selector) -> Result<client::Session> {
+    let devices = client::list_devices(&mut connect(address).await?).await?;
+    let device = selector
+        .find(&devices)
+        .ok_or_else(|| anyhow!("no exported device matches {selector:?}"))?;
+    // The server closes the connection after a device list, so importing needs a new one.
+    let session = client::import(connect(address).await?, &device.busid).await?;
+    log::info!("imported {:?}", session.device());
+    Ok(session)
 }
 
-fn create_runtime() -> Result<tokio::runtime::Runtime, std::io::Error> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
+#[cfg(not(target_os = "macos"))]
+fn attach(
+    _runtime: &tokio::runtime::Runtime,
+    _address: &str,
+    _selector: &Selector,
+    _wait_for_enter: bool,
+) -> Result<()> {
+    Err(anyhow!("attaching devices is only supported on macOS"))
 }
 
-fn find_target_device<'a>(
-    devices: &'a [crate::usbip::Device],
-    config: &AttachConfig,
-) -> Option<&'a crate::usbip::Device> {
-    devices.iter().find(|d| {
-        if let Some(busid) = &config.busid {
-            d.get_busid() == busid.as_bytes()
-        } else if let Some(device) = &config.device {
-            d.get_devnum() == *device
-        } else if let (Some(vendor_id), Some(product_id)) = (config.vendor_id, config.product_id) {
-            d.get_id_vendor() == vendor_id && d.get_id_product() == product_id
-        } else {
-            false
-        }
-    })
-}
+#[cfg(target_os = "macos")]
+fn attach(
+    runtime: &tokio::runtime::Runtime,
+    address: &str,
+    selector: &Selector,
+    wait_for_enter: bool,
+) -> Result<()> {
+    use std::{io::Write, time::Duration};
+    use tokio::signal::unix::{signal, SignalKind};
+    use usbip_macos::host::Controller;
 
-fn spawn_polling_task(
-    rt: &tokio::runtime::Runtime,
-    usbip_client: ForceableSend<Arc<UnsafeCell<UsbIpClient>>>,
-) {
-    let client_for_signal = ForceableSend(Arc::clone(&usbip_client.0));
+    let session = runtime.block_on(import(address, selector))?;
+    let controller =
+        Controller::new(session.clone(), runtime.handle().clone()).map_err(|e| anyhow!(e))?;
 
-    // Spawn the polling task
-    rt.spawn(async move {
-        debug!("Controller interface initialized successfully.");
-        let cl = usbip_client;
-        loop {
-            unsafe {
-                let client_ref = &mut *cl.0.get();
-                if let Err(error) = client_ref.poll().await {
-                    eprintln!("Error polling USB/IP client: {}", error);
-                    process::exit(1);
-                }
-            }
-        }
-    });
+    runtime.block_on(controller.wait_powered());
+    if wait_for_enter {
+        print!("Press Enter to connect the device...");
+        std::io::stdout().flush()?;
+        std::io::stdin().read_line(&mut String::new())?;
+    }
+    controller.set_connected(true);
 
-    // Spawn the signal handler task
-    rt.spawn(async move {
-        let cl = client_for_signal;
-
-        let ctrl_c = signal::ctrl_c();
-
-        let terminate = async {
-            signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("Failed to install SIGTERM handler")
-                .recv()
-                .await;
-        };
-
+    let outcome = runtime.block_on(async {
+        let mut term = signal(SignalKind::terminate())?;
         tokio::select! {
-            _ = ctrl_c => {
-                debug!("Received SIGINT, shutting down...");
-            }
-            _ = terminate => {
-                debug!("Received SIGTERM, shutting down...");
-            }
+            _ = tokio::signal::ctrl_c() => Ok(()),
+            _ = term.recv() => Ok(()),
+            reason = session.closed() => Err(anyhow!("connection lost: {reason}")),
         }
-
-        // Unlink all pending transactions before exiting
-        eprintln!("\nShutting down, unlinking pending transactions...");
-        unsafe {
-            let client_ref = &mut *cl.0.get();
-            if let Err(e) = client_ref.unlink_all_pending().await {
-                eprintln!("Error unlinking pending transactions: {}", e);
-            }
-        }
-
-        process::exit(0);
     });
+
+    log::info!("detaching");
+    controller.set_connected(false);
+    session.unlink_all();
+    runtime.block_on(async {
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            while session.pending() > 0 && !session.is_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+    });
+    drop(controller);
+    session.close();
+    outcome
 }
