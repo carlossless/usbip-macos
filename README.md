@@ -27,4 +27,3 @@ The device stays attached until you stop the client.
   limitation: `IOUSBHostControllerInterface` doesn't properly support isochronous transfers.
 - UAS disks work, but only as plain mass storage. This is also a macOS limitation:
   `IOUSBHostControllerInterface` doesn't support the bulk streams UAS needs.
-- Hubs can't be attached; attach the devices behind them instead.
